@@ -1,0 +1,38 @@
+mcuboot:
+  address: 0x00000
+  size: 0x08000
+  region: flash_primary
+
+mcuboot_pad:
+  address: 0x08000
+  size: 0x00200
+  region: flash_primary
+
+app:
+  address: 0x08200
+  size: 0x27e00
+  region: flash_primary
+
+mcuboot_primary:
+  address: 0x08000
+  size: 0x28000
+  region: flash_primary
+  span: [mcuboot_pad, app]
+
+mcuboot_primary_app:
+  address: 0x08200
+  size: 0x27e00
+  region: flash_primary
+  span: [app]
+
+mcuboot_secondary:
+  address: 0x00000
+  size: 0x28000
+  region: external_flash
+  device: W25Q64
+
+nvs_storage:
+  address: 0x28000
+  size: 0x6000
+  region: external_flash
+  device: W25Q64

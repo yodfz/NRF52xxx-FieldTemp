@@ -7,7 +7,7 @@
  *   CONFIG_CLOCK_CONTROL_NRF_K32SRC_RC=y  (使用内部 RC 作为 32kHz 时钟源)
  *   这确保系统不会因等待外部晶振起振而卡死
  * 
- * - LED 配置：DATA LED: P0.31, LINK LED: P0.30
+ * - LED 配置：DATA LED: P0.4, LINK LED: P0.5
  *   LED 为低电平有效（低电平点亮，高电平熄灭）
  *   DATA LED 用于指示数据状态
  *   LINK LED 用于指示蓝牙连接状态
@@ -46,11 +46,14 @@
 #include "storage/nvs_config.h"
 #include "ble/ble_adv.h"
 #include "ble/ble_services.h"
+#include "ble/ble_ota.h"
 #include "led.h"
+#include "vdd.h"
 
 // RAM Buffer Definitions
-#define RAM_BUFFER_SIZE 5
-
+// 注意：RAM_BUFFER_SIZE 由 common.h 统一定义（此处曾重复定义，属"同一宏两处定义"，已清理）。
+// 语义变更（D-2）：本缓冲区**不再是"攒满一批再写"的批量缓冲**，而是 Flash 临时失败后的**重试区**；
+// 正常情况下每形成一条历史记录就立即落盘，缓冲区随即清空。
 static struct data_record ram_buffer[RAM_BUFFER_SIZE];
 static uint8_t ram_buffer_count = 0;
 
@@ -59,7 +62,6 @@ static void history_send_work_handler(struct k_work *work);
 
 // UUID 宏定义使用 ble/ble_services.h 中的版本
 // UUID 结构体变量（用于 BT_GATT_SERVICE_DEFINE）
-static struct bt_uuid_128 time_sync_service_uuid __maybe_unused = BT_UUID_INIT_128(BT_UUID_TIME_SYNC_SERVICE_VAL);
 static struct bt_uuid_128 time_sync_char_uuid = BT_UUID_INIT_128(BT_UUID_TIME_SYNC_CHAR_VAL);
 
 static struct bt_uuid_128 config_service_uuid = BT_UUID_INIT_128(BT_UUID_CONFIG_SERVICE_VAL);
@@ -84,15 +86,19 @@ static bool bt_ready = false;  // 蓝牙是否就绪
 // 时间同步相关变量
 static uint32_t time_base_timestamp = 0;  // 基准时间戳（Unix 时间戳，秒）
 static int64_t time_base_uptime = 0;      // 基准时间对应的系统运行时间（毫秒）
-static bool time_synced = false;           // 时间是否已同步
+static bool time_synced = false;           // 时间是否已同步（含从 NVS 恢复的旧时间）
+/* 时间基准是否来自**本次上电的手机对时**（决定是否按墙钟边界结算、是否对外宣称对齐）。
+ * 仅从 NVS 恢复的旧时间不满足：设备停机期间秒数停走，恢复出来的时间必然偏慢，
+ * 此时若仍按整分网格结算，会造出"看起来权威但绝对时刻是错的"时间戳。
+ * 故只做严格等间隔（v6 行为），不宣称落在 :00 —— 见 §12.9。 */
+static bool wall_clock_aligned = false;
 
 // 配置相关变量
-#define FIRMWARE_VERSION         2  // 固件版本号
-#define DEFAULT_SAMPLE_INTERVAL  1  // 默认采集间隔：1秒
-#define MIN_SAMPLE_INTERVAL      1  // 最小采集间隔：1秒
-#define MAX_SAMPLE_INTERVAL      3600  // 最大采集间隔：3600秒（1小时）
-static uint16_t sample_interval = DEFAULT_SAMPLE_INTERVAL;  // 当前采集间隔（秒）
-static uint16_t record_count = 0;  // 记录数（简化实现，实际应该从缓冲区获取）
+// FIRMWARE_VERSION / SAMPLE_INTERVAL_FIXED / DEFAULT_HISTORY_INTERVAL / MIN|MAX_HISTORY_INTERVAL
+// 统一定义在 storage/nvs_config.h（此处曾重复定义同一批宏，已清理，避免"文档与实现不一致"）。
+static uint16_t sample_interval = SAMPLE_INTERVAL_FIXED;      // 采样周期：固定 1 秒（实时显示 + 最高最低温度）
+static uint16_t history_interval = DEFAULT_HISTORY_INTERVAL;  // 历史记录落盘周期（秒），60~3600，BLE 可配
+static uint16_t record_count = 0;  // 已落盘记录计数（诊断用；对外以 storage_get_total_records() 为准）
 static int16_t max_temperature = INT16_MIN;  // 最高温度（0.01°C），初始化为最小值
 static int16_t min_temperature = INT16_MAX;  // 最低温度（0.01°C），初始化为最大值
 static uint32_t max_temperature_timestamp = 0;  // 最高温度发生时间（Unix时间戳，秒）
@@ -103,6 +109,38 @@ static struct k_work sample_work;  // 采集工作队列
 static struct k_work_delayable sample_start_work;  // 首次采集启动延迟工作队列
 static struct k_work_delayable config_save_work;  // 配置延迟保存工作队列
 static bool config_dirty = false;  // 配置是否已修改但未保存
+
+// ========== 历史记录聚合状态（1 秒采样 -> history_interval 一条均值记录）==========
+// 三个通道**独立累加**：某个传感器（尤其气压）故障时，其余通道仍能正常成记录。
+// 这是对原实现的修正：原代码气压读失败时写 0，随后又被"气压范围校验"整条丢弃，
+// 结果是气压传感器一坏就完全不落盘。
+static int32_t  acc_temp_sum;      // 窗口内温度累加（0.01°C）
+static uint32_t acc_hum_sum;       // 窗口内湿度累加（0.01%RH）
+static uint32_t acc_press_sum;     // 窗口内气压累加（Pa）
+static uint16_t acc_temp_n;        // 温度有效样本数
+static uint16_t acc_hum_n;         // 湿度有效样本数
+static uint16_t acc_press_n;       // 气压有效样本数
+static uint16_t window_ticks;      // 窗口内**实际聚合到**的采样节拍数（诊断用；不再是结算依据）
+static uint32_t window_deadline_ms;  // 本窗口的结算时刻（uptime ms，绝对网格；回绕安全）
+/* 本窗口结算后要写入记录的**墙钟边界时间戳**（interval 的整数倍）。
+ * 仅当 wall_clock_aligned 为真时有效；否则为 0，记录时间戳退回"结算时刻的真实秒"。
+ * 周期记录用边界值而不是"实际执行完成的时刻"——后者会带 0~1 秒的执行抖动。 */
+static uint32_t window_boundary_ts;
+static uint32_t last_valid_pressure_pa;  // 最近一次有效气压（气压通道故障时的回退值）
+static uint32_t dropped_records;   // Flash 持续失败导致丢弃的记录数（诊断用）
+
+// 事件记录（突变/越限）判定基准
+static int16_t  last_record_temp;  // 上一条已落盘记录的温度
+static uint16_t last_record_hum;   // 上一条已落盘记录的湿度
+static uint32_t last_record_ts;    // 上一条已落盘记录的时间戳
+static bool     last_record_valid; // 是否已有可比对的基准记录
+static uint8_t  alarm_state;       // 0=正常，1=越限（用于边沿触发）
+static uint32_t last_event_uptime_ms;  // 上一条事件记录的时刻（uptime，免疫对时跳变）
+static bool     last_event_seen;       // 是否已发过事件记录（限流基准是否有效）
+static uint8_t  event_pending_kind;    // 被限流挡下、待补发的事件类型（见 EVENT_KIND_*）
+
+// 写头持久化：storage_write_batch() 发生扇区切换时置位
+static bool sector_switched_flag;
 
 // 清空数据控制标志位
 static bool data_clear_in_progress = false;  // 清空数据进行中标志，用于停止采集和存储
@@ -170,6 +208,435 @@ static uint32_t get_current_timestamp(void);
 // NVS 相关已移至 storage/nvs_config.c
 // 使用 nvs_config_init(), nvs_config_is_ready() 等接口
 static bool position_dirty = false;
+
+/* ================== 历史记录：聚合、事件与落盘策略（D-2）==================
+ *
+ * 采样：固定 1 秒一次（周期定时器；实时 BLE 显示 + 最高最低温度跟踪）。
+ * 记录：窗口结算走 **绝对网格**（见 history_window_realign/advance_deadline），
+ *       而不是"数够 N 个节拍"。每个周期**恰好** history_interval 秒，且不累积漂移。
+ *       每条记录生成后**立即落盘**，故正常掉电最多丢失不足一个 history_interval 的数据。
+ *
+ *       【时间戳语义：周期记录 = 边界值，事件记录 = 真实时刻】
+ *       有可信墙钟（本次上电收到过手机对时）时，结算网格锚定在**墙钟边界**上：
+ *       60 秒 → 每分钟 :00，300 秒 → :00/:05/:10…，公式 `((now/iv)+1)*iv`。
+ *       周期记录写入的是**边界时间戳**，不是"工作执行完成的时刻"（后者带 0~1 秒抖动，
+ *       可能跨分钟落到错误的一格）。对时或改 history_interval 后**重算下一边界**。
+ *       首个窗口可能不足一个周期（12:34:27 对时 → 12:35:00 出首条）：刻意保留这 33 秒，
+ *       比"先等到整分再开始累计"少丢一段数据；仅在统计严谨性要求极高时才该丢弃首窗。
+ *       事件记录**仍用真实发生时刻**，不做任何对齐。
+ *
+ *       仅从 NVS 恢复旧时间时**不宣称墙钟对齐**，也不按边界结算（退回严格等间隔）。
+ *       设备停机期间秒数停走，恢复出来的基准必然偏慢，按它算整分只会造出
+ *       "看起来权威、绝对时刻是错的"时间戳。该状态通过状态帧能力位对外披露。
+ *       **存量记录不重写**：允许升级点前后时间戳规则不同，整齐与否交给 App 显示层分桶。
+ *
+ *       【与存储无关】以上全部只影响"记录里写什么时间戳"和"何时结算"，
+ *       **绝不触碰 NVS 写头 / 环形缓冲位置**。写头只表示下一条物理写入位置，
+ *       与分钟边界没有任何关系，不得为了时间对齐而移动或归零。
+ *
+ *       【为什么必须换成绝对网格】早期实现是"单次定时器 + 工作完成后重武装 1 秒"，
+ *       于是实际周期 = 1 秒 + 工作耗时 ≈ 1.13 秒，60 拍实测约 68 秒/条。
+ *       周期定时器可以消掉"重武装"这一项，但只要某个节拍因为工作队列忙而被丢弃
+ *       （k_work_submit 对正在运行的 work 返回 -EBUSY），"数节拍"仍会漂移。
+ *       只有按 uptime 结算才能对"真实分钟边界"给出硬保证。
+ *
+ * 事件：温湿度突变或越限时，额外立即追加一条**瞬时**记录，不打断均值窗口。
+ *       所有事件共用一个限流闸门（EVENT_KIND_* + gap 判定），越限/恢复边沿**不例外**；
+ *       被闸门挡下的事件不丢弃，记入 event_pending_kind 延后补发（见 history_maybe_event）。
+ *
+ * 缓冲：RAM 缓冲（RAM_BUFFER_SIZE 条）只作为 Flash 临时失败后的**重试区**，
+ *       写入失败时保留未写入部分、下一拍继续尝试，不再作为批量写入条件。
+ * 写头：NVS 中的写头位置在**扇区切换时立即持久化**，其余由 30 秒定时 flush 兜底。
+ *
+ * 事件记录的容量影响（必须知情）：事件记录会额外占用容量。
+ *   名义（无事件）：65000 × history_interval / 86400 天 —— 60 秒时 45.1 天。
+ *   限流上限为"**任意两条事件记录之间至少间隔一个 history_interval**"（单一闸门，
+ *   越限/恢复/突变一视同仁），故最坏情况记录速率为名义的 **2 倍**。
+ *   这条 2 倍上界是"30 天承诺"的推导前提：一旦闸门被绕过（历史上越限边沿就绕过过），
+ *   抖动信号可以每秒追加一条，速率变成名义的 60 倍，容量口径直接失效。
+ *   产品承诺 30 天按 60 秒周期 + 现实事件率成立；若事件长期饱和，保留期会缩短。
+ */
+
+/* 事件记录阈值（初值，可按现场标定） */
+#define EVENT_RECORDS_ENABLE        1        /* 0 = 关闭事件记录，只落周期均值 */
+#define EVENT_SUDDEN_TEMP_DELTA     100      /* 温度突变阈值：1.00°C */
+#define EVENT_SUDDEN_HUM_DELTA      500      /* 湿度突变阈值：5.00%RH */
+#define EVENT_TEMP_ALARM_LOW        (-2000)  /* 越限下限：-20.00°C */
+#define EVENT_TEMP_ALARM_HIGH       6000     /* 越限上限：+60.00°C */
+#define EVENT_HUM_ALARM_LOW         500      /* 越限下限：5.00%RH */
+#define EVENT_HUM_ALARM_HIGH        9500     /* 越限上限：95.00%RH */
+
+/* 待补发事件的类型。优先级：越限/恢复 > 突变（越限信息量更大，不能被突变挤掉） */
+enum {
+	EVENT_KIND_NONE = 0,
+	EVENT_KIND_ALARM,        /* 进入越限 */
+	EVENT_KIND_ALARM_CLEAR,  /* 越限恢复 */
+	EVENT_KIND_SUDDEN,       /* 温湿度突变 */
+};
+
+/* 预计保留天数（名义速率，供 BLE 状态帧上报） */
+static uint16_t history_retention_days(void)
+{
+	uint32_t days = ((uint32_t)W25Q64_MAX_RECORDS * history_interval) / 86400U;
+	return (days > 0xFFFFU) ? 0xFFFFU : (uint16_t)days;
+}
+
+/* 四舍五入的整数除法：温度可负，除法向零截断 */
+static int32_t div_round_s32(int32_t sum, uint16_t n)
+{
+	if (n == 0U) {
+		return 0;
+	}
+	if (sum >= 0) {
+		return (sum + (int32_t)(n / 2U)) / (int32_t)n;
+	}
+	return -(((-sum) + (int32_t)(n / 2U)) / (int32_t)n);
+}
+
+static uint32_t div_round_u32(uint32_t sum, uint16_t n)
+{
+	if (n == 0U) {
+		return 0U;
+	}
+	return (sum + (uint32_t)(n / 2U)) / (uint32_t)n;
+}
+
+/* 清空当前聚合窗口的累加器。
+ * 注意：**不动 window_deadline_ms** —— 结算时刻由网格推进，不随结算成功与否改变。
+ * 需要"从现在起重新数一个完整周期（并对齐到墙钟边界）"时，请用 history_window_realign()。 */
+static void history_window_reset(void)
+{
+	acc_temp_sum = 0;
+	acc_hum_sum = 0;
+	acc_press_sum = 0;
+	acc_temp_n = 0;
+	acc_hum_n = 0;
+	acc_press_n = 0;
+	window_ticks = 0;
+}
+
+/* 归一化后的历史周期（秒）：防御 history_interval 越界或为 0。
+ * 0 会让网格推进变成死循环（+0 永远追不上 now），而它跑在系统工作队列上，会把系统拖死。 */
+static inline uint16_t history_period_sec(void)
+{
+	uint16_t iv = history_interval;
+	if (iv < MIN_HISTORY_INTERVAL || iv > MAX_HISTORY_INTERVAL) {
+		iv = DEFAULT_HISTORY_INTERVAL;
+	}
+	return iv;
+}
+
+static inline uint32_t history_period_ms(void)
+{
+	return (uint32_t)history_period_sec() * 1000U;
+}
+
+/* 是否具备**可信墙钟**：时间基准来自本次上电的手机对时。
+ * 只有它成立时才按墙钟边界结算，并对外宣称"周期记录落在整分/整 5 分"。 */
+static inline bool wallclock_ready(void)
+{
+	return time_synced && wall_clock_aligned;
+}
+
+/* 下一个墙钟边界：`((now / interval) + 1) * interval`。
+ * 60 秒 → 下一分钟 :00；300 秒 → 下一个 :00/:05/:10…；3600 秒 → 下一个整点。
+ * 用整数除法直接取整，不依赖任何日历运算。 */
+static uint32_t next_wallclock_boundary(uint32_t now_ts)
+{
+	uint32_t iv = history_period_sec();
+	return ((now_ts / iv) + 1U) * iv;
+}
+
+/* 把墙钟秒换算成 uptime 毫秒。
+ * 用 int32 求"秒差"再乘 1000：直接对 uint32 秒做 (ts - base) * 1000 会溢出。
+ * int32 秒差的可表达范围是 ±68 年，足够覆盖对时偏差。 */
+static uint32_t wallclock_ts_to_uptime_ms(uint32_t ts)
+{
+	int64_t delta_ms = (int64_t)(int32_t)(ts - time_base_timestamp) * 1000;
+	return (uint32_t)(time_base_uptime + delta_ms);
+}
+
+/* 重新对齐窗口：清累加器 + 把结算时刻落到网格上。
+ * 用于对时、周期配置变更、清空数据、首次启动等会打断节奏的场景。
+ *
+ * 有可信墙钟 → 对齐到**下一个整边界**。首个窗口可能不足一个周期（例如 12:34:27 对时，
+ *   12:35:00 就出第一条），这是刻意的：比"先等到整分再开始累计"少丢 33 秒数据，
+ *   而首条记录的时间戳依然整齐。事件记录不受影响（仍用真实发生时刻）。
+ * 无可信墙钟 → 退回"从现在起一个完整周期"：严格等间隔，但**不宣称**落在 :00。 */
+static void history_window_realign(void)
+{
+	history_window_reset();
+
+	if (!wallclock_ready()) {
+		window_boundary_ts = 0;
+		window_deadline_ms = k_uptime_get_32() + history_period_ms();
+		return;
+	}
+
+	window_boundary_ts = next_wallclock_boundary(get_current_timestamp());
+	window_deadline_ms = wallclock_ts_to_uptime_ms(window_boundary_ts);
+}
+
+/* 窗口结算时刻是否已到（uptime ms 回绕安全：用有符号差判正负） */
+static inline bool history_window_due(void)
+{
+	return (int32_t)(k_uptime_get_32() - window_deadline_ms) >= 0;
+}
+
+/* 按**绝对网格**推进结算时刻：跳到严格晚于 now 的下一个网格点
+ * （而非 deadline = now + period）。这样节拍抖动、丢拍、本函数被迟调用都不会累积成漂移
+ * —— 这正是"真实分钟边界"的来源。
+ *
+ * 用整除一次算到位，而不是 do-while 循环：设备可能被调试器 halt 住很久或长时间阻塞，
+ * 那时差可能是几十万毫秒，循环要跑上千次。取法保证推进后**严格晚于** now，
+ * 即一个周期只结算一条记录，不会为"错过的窗口"补出一串空记录
+ * （那段时间本来就没采到数据，补记录等于伪造数据点）。 */
+static void history_window_advance_deadline(void)
+{
+	uint32_t period = history_period_ms();
+
+	if (!wallclock_ready()) {
+		/* 无墙钟基准：纯 uptime 网格，严格等间隔（v6 行为） */
+		int32_t behind_ms = (int32_t)(k_uptime_get_32() - window_deadline_ms);
+
+		if (behind_ms >= 0) {
+			window_deadline_ms += ((uint32_t)behind_ms / period + 1U) * period;
+		} else {
+			window_deadline_ms += period;
+		}
+		return;
+	}
+
+	uint32_t iv     = history_period_sec();
+	uint32_t now_ts = get_current_timestamp();
+	int32_t  behind = (int32_t)(now_ts - window_boundary_ts);
+
+	if (behind < 0) {
+		/* 时钟被往回对时：重算边界，而不是在当前边界上硬加一个周期 */
+		window_boundary_ts = next_wallclock_boundary(now_ts);
+		window_deadline_ms = wallclock_ts_to_uptime_ms(window_boundary_ts);
+		return;
+	}
+
+	window_boundary_ts += ((uint32_t)behind / iv + 1U) * iv;
+	window_deadline_ms = wallclock_ts_to_uptime_ms(window_boundary_ts);
+}
+
+/* 把 ram_buffer 中待写记录写入 Flash。
+ * storage_write_batch() 的约定：失败时把**未写入**的记录保留在缓冲区前部（ram_buffer_count > 0）。*/
+static void history_flush_buffer(void)
+{
+	if (ram_buffer_count == 0U) {
+		return;
+	}
+	if (!time_synced) {
+		/* 记录只有在时间已同步时才会生成；此处保留缓冲，等时间同步后补写 */
+		return;
+	}
+	if (!w25q64_is_ready()) {
+		static int not_ready_log;
+		if (not_ready_log++ % 30 == 0) {
+			printk("[存储] W25Q64 未就绪，%d 条记录留在缓冲区等待重试\r\n",
+			       ram_buffer_count);
+		}
+		return;
+	}
+
+	uint8_t pending = ram_buffer_count;
+
+	storage_write_batch();
+
+	if (sector_switched_flag) {
+		/* 写头跨扇区：立即持久化，缩短掉电后写头不一致的窗口 */
+		sector_switched_flag = false;
+		storage_position_t pos = {
+			.next_sector = next_sector,
+			.oldest_sector = oldest_sector,
+			.next_record_in_sector = next_record_in_sector
+		};
+		nvs_save_storage_position(&pos);
+		position_dirty = false;
+	}
+
+	if (ram_buffer_count > 0U) {
+		printk("[存储] 落盘未完成: %d 条待重试 (本次待写 %d 条)\r\n",
+		       ram_buffer_count, pending);
+	}
+}
+
+/* 追加一条记录到缓冲区并立即尝试落盘 */
+static void history_push_record(uint32_t ts, int16_t temperature,
+				uint16_t humidity, uint32_t pressure_pa)
+{
+	/* OTA 期间暂停历史落盘：与 OTA 共用同一颗 W25Q64，且 SPI 争用会造成
+	 * OTA 写入的延迟抖动。这里只跳过本窗口的采样，不进重试缓冲 ——
+	 * 避免 OTA 结束后一次性补写，重新制造争用。 */
+	if (ble_ota_in_progress()) {
+		return;
+	}
+
+	if (ram_buffer_count >= RAM_BUFFER_SIZE) {
+		/* 缓冲区满：说明 Flash 连续失败。丢弃最旧一条，优先保住最新数据 */
+		memmove(&ram_buffer[0], &ram_buffer[1],
+			sizeof(ram_buffer[0]) * (RAM_BUFFER_SIZE - 1));
+		ram_buffer_count = RAM_BUFFER_SIZE - 1;
+		dropped_records++;
+		printk("[存储] 警告: 重试缓冲已满，丢弃最旧记录 (累计丢弃 %u 条)\r\n",
+		       dropped_records);
+	}
+
+	ram_buffer[ram_buffer_count].timestamp = ts;
+	ram_buffer[ram_buffer_count].temperature = temperature;
+	ram_buffer[ram_buffer_count].humidity = humidity;
+	ram_buffer[ram_buffer_count].pressure_pa = pressure_pa;
+	ram_buffer_count++;
+	record_count++;
+
+	history_flush_buffer();
+}
+
+/* 窗口结束：生成周期均值记录。
+ * 成记录条件：本窗口有**温度**有效样本且时间已同步。
+ * 湿度/气压缺失时分别回退到上一条记录值与最近一次有效气压，避免因单一传感器故障丢整条记录。
+ *
+ * 时间戳取**窗口边界**（wallclock_ready 时为 interval 的整数倍），而不是"工作执行完成的时刻"：
+ * 结算发生在边界之后的第一个采样拍上，用完成时刻会引入 0~1 秒抖动，
+ * 甚至跨分钟落到错误的一格里。无可信墙钟时退回真实秒（此时本来就不宣称对齐）。*/
+static void history_commit_average(void)
+{
+	uint32_t ts = (wallclock_ready() && window_boundary_ts != 0U)
+			      ? window_boundary_ts
+			      : get_current_timestamp();
+
+	if (acc_temp_n == 0U) {
+		static int empty_log;
+		if (empty_log++ % 5 == 0) {
+			printk("[存储] 本窗口无有效温度采样或无时间基准，跳过均值记录\r\n");
+		}
+		history_window_reset();
+		return;
+	}
+	if (ts == 0U) {
+		printk("[存储] 时间未同步，丢弃本窗口均值记录\r\n");
+		history_window_reset();
+		return;
+	}
+
+	int32_t  t_avg = div_round_s32(acc_temp_sum, acc_temp_n);
+	uint32_t h_avg = (acc_hum_n > 0U)
+			 ? div_round_u32(acc_hum_sum, acc_hum_n)
+			 : (uint32_t)(last_record_valid ? last_record_hum : 0U);
+	uint32_t p_avg = (acc_press_n > 0U)
+			 ? div_round_u32(acc_press_sum, acc_press_n)
+			 : (last_valid_pressure_pa ? last_valid_pressure_pa : 101325U);
+
+	printk("[存储] 周期记录(均值 %u 点 / 温%u 湿%u 压%u): 时间戳=%u T=%d.%02d H=%u.%02u P=%uPa\r\n",
+	       window_ticks, acc_temp_n, acc_hum_n, acc_press_n, ts,
+	       t_avg / 100, (t_avg >= 0 ? t_avg : -t_avg) % 100,
+	       h_avg / 100, h_avg % 100, p_avg);
+
+	history_push_record(ts, (int16_t)t_avg, (uint16_t)h_avg, p_avg);
+
+	/* 更新突变判定基准：与"上一条已落盘记录"比较才有意义 */
+	last_record_temp = (int16_t)t_avg;
+	last_record_hum = (uint16_t)h_avg;
+	last_record_ts = ts;
+	last_record_valid = true;
+
+	history_window_reset();
+}
+
+/* 事件记录：越限/恢复边沿 与 温湿度突变，共用**同一个限流闸门**。
+ *
+ * 关键约束（30 天容量口径的推导前提）：任意两条事件记录之间至少间隔一个 history_interval，
+ * 因此总记录速率上界 = 名义的 2 倍。越限/恢复边沿**不享受任何豁免** —— 早期实现里
+ * `if (alarm_edge) { emit = true; }` 完全绕过 gap 判定，阈值附近抖动的信号会每秒追加一条，
+ * 速率变成名义的 60 倍，既推翻文档承诺的 2 倍上界，也让保留期失去可预测性。
+ *
+ * 为不让"越限边沿被限流直接丢掉"，被挡下的意图记入 event_pending_kind，
+ * 间隔满足后的第一拍补发（最坏延后一个 history_interval，事件不丢）。
+ *
+ * 限流基准用 **uptime** 而非记录时间戳：对时基准被改写（手机重新对时）时
+ * 时间戳可能跳变，用它算间隔会得出错误结果。 */
+static void history_maybe_event(int32_t temperature, uint32_t humidity,
+				uint32_t pressure_pa, uint32_t ts)
+{
+#if EVENT_RECORDS_ENABLE
+	if (ts == 0U) {
+		return;
+	}
+
+	bool alarm = (temperature < EVENT_TEMP_ALARM_LOW) ||
+		     (temperature > EVENT_TEMP_ALARM_HIGH) ||
+		     (humidity < EVENT_HUM_ALARM_LOW) ||
+		     (humidity > EVENT_HUM_ALARM_HIGH);
+	bool alarm_edge = (alarm != (alarm_state != 0U));
+
+	/* 无论本拍是否真的落记录，越限状态都要跟着走：
+	 * 否则被限流挡下的边沿会在下一拍重复判成"边沿"，边沿语义就没了。 */
+	alarm_state = alarm ? 1U : 0U;
+
+	bool sudden = false;
+	if (last_record_valid) {
+		int32_t dt = (int32_t)temperature - (int32_t)last_record_temp;
+		int32_t dh = (int32_t)humidity - (int32_t)last_record_hum;
+		if (dt < 0) {
+			dt = -dt;
+		}
+		if (dh < 0) {
+			dh = -dh;
+		}
+		sudden = (dt >= EVENT_SUDDEN_TEMP_DELTA) || (dh >= EVENT_SUDDEN_HUM_DELTA);
+	}
+
+	/* 登记事件意图（不立即发送）：越限/恢复覆盖突变，突变不挤掉越限 */
+	if (alarm_edge) {
+		event_pending_kind = alarm ? EVENT_KIND_ALARM : EVENT_KIND_ALARM_CLEAR;
+	} else if (sudden && event_pending_kind == EVENT_KIND_NONE) {
+		event_pending_kind = EVENT_KIND_SUDDEN;
+	}
+
+	if (event_pending_kind == EVENT_KIND_NONE) {
+		return;
+	}
+
+	/* 限流闸门：所有事件类型共用，越限/恢复不例外。
+	 * "是否发过第一条"用独立布尔判定，不用 last_event_uptime_ms == 0 当哨兵 ——
+	 * 万一第一条事件恰好发生在 uptime 0 ms，哨兵就永远为真，闸门形同虚设。 */
+	bool gap_ok = !last_event_seen ||
+		      ((uint32_t)(k_uptime_get_32() - last_event_uptime_ms) >= history_period_ms());
+	if (!gap_ok) {
+		return;   /* 保留 event_pending_kind，下一拍继续尝试补发 */
+	}
+
+	const char *why = (event_pending_kind == EVENT_KIND_ALARM)        ? "越限"
+			  : (event_pending_kind == EVENT_KIND_ALARM_CLEAR) ? "越限恢复"
+									  : "突变";
+	event_pending_kind = EVENT_KIND_NONE;
+
+	printk("[事件] %s: 时间戳=%u T=%d.%02d H=%u.%02u P=%uPa\r\n",
+	       why, ts,
+	       temperature / 100,
+	       (temperature >= 0 ? temperature : -temperature) % 100,
+	       humidity / 100, humidity % 100, pressure_pa);
+
+	history_push_record(ts, (int16_t)temperature,
+			    (uint16_t)humidity, pressure_pa);
+
+	last_event_uptime_ms = k_uptime_get_32();
+	last_event_seen = true;
+	last_record_temp = (int16_t)temperature;
+	last_record_hum = (uint16_t)humidity;
+	last_record_ts = ts;
+	last_record_valid = true;
+#else
+	(void)temperature;
+	(void)humidity;
+	(void)pressure_pa;
+	(void)ts;
+#endif
+}
+
 // RAM_BUFFER_SIZE moved to top
 // struct data_record moved to top
 // ram_buffer moved to top
@@ -248,9 +715,16 @@ static void local_nvs_flush(void)
 	if (!nvs_config_is_ready()) {
 		return;
 	}
+	/* OTA 期间**延迟** NVS 写入：历史/NVS 与 OTA 共用同一颗 W25Q64 与同一条 SPI
+	 * （nvs_config.c 用的就是 w25q64 的互斥量），并发访问会互相破坏。
+	 * 这里是延迟而非丢弃 —— dirty 标志保持，OTA 结束或重启前会再落盘。 */
+	if (ble_ota_in_progress()) {
+		return;
+	}
 	if (config_dirty) {
 		device_config_ctx_t ctx = {
 			.sample_interval = sample_interval,
+			.history_interval = history_interval,
 			.max_temperature = max_temperature,
 			.min_temperature = min_temperature,
 			.max_temperature_timestamp = max_temperature_timestamp,
@@ -262,8 +736,9 @@ static void local_nvs_flush(void)
 		nvs_flush(&ctx, NULL);
 		if (!ctx.config_dirty) {
 			config_dirty = false;
-			printk("[NVS] 配置已写入 间隔=%d 最高=%d.%02d(时间戳:%u) 最低=%d.%02d(时间戳:%u)\r\n",
+			printk("[NVS] 配置已写入 采样=%d秒 历史=%d秒 最高=%d.%02d(时间戳:%u) 最低=%d.%02d(时间戳:%u)\r\n",
 			       sample_interval,
+			       history_interval,
 			       max_temperature / 100, (max_temperature >= 0 ? max_temperature : -max_temperature) % 100,
 			       max_temperature_timestamp,
 			       min_temperature / 100, (min_temperature >= 0 ? min_temperature : -min_temperature) % 100,
@@ -288,7 +763,8 @@ static void load_config(void)
 	nvs_load_config(&ctx);
 	
 	// 从上下文复制到全局变量
-	sample_interval = ctx.sample_interval;
+	sample_interval = SAMPLE_INTERVAL_FIXED;   // 采样固定 1 秒，不再来自 NVS
+	history_interval = ctx.history_interval;   // 历史记录落盘周期（60~3600 秒）
 	max_temperature = ctx.max_temperature;
 	min_temperature = ctx.min_temperature;
 	max_temperature_timestamp = ctx.max_temperature_timestamp;
@@ -327,22 +803,25 @@ static void save_config(bool immediate)
 
 // ========== 配置服务GATT回调函数 ==========
 
-// 采集间隔特性数据缓冲区
-static uint8_t interval_char_data[2];  // uint16_t，2字节
+// 历史记录间隔特性数据缓冲区（uint16_t，2字节）
+// 注意：UUID 12340021 与 2 字节格式保持不变（对旧 App 影响最小），但**语义已变更**：
+// v3 起该特性表示"历史记录落盘间隔（秒）"，不再表示采样间隔（采样固定 1 秒）。
+// App 侧可通过状态特性的能力标志（byte5 bit0）判定固件是否已采用新语义。
+static uint8_t interval_char_data[2];
 
-// 采集间隔特性读取回调
+// 历史记录间隔特性读取回调
 static ssize_t interval_char_read_cb(struct bt_conn *conn,
 				     const struct bt_gatt_attr *attr,
 				     void *buf, uint16_t len, uint16_t offset)
 {
 	// 更新数据
-	sys_put_le16(sample_interval, interval_char_data);
+	sys_put_le16(history_interval, interval_char_data);
 	
 	return bt_gatt_attr_read(conn, attr, buf, len, offset,
 				 interval_char_data, sizeof(interval_char_data));
 }
 
-// 采集间隔特性写入回调
+// 历史记录间隔特性写入回调
 static ssize_t interval_char_write_cb(struct bt_conn *conn,
 				       const struct bt_gatt_attr *attr,
 				       const void *buf, uint16_t len, uint16_t offset,
@@ -353,38 +832,85 @@ static ssize_t interval_char_write_cb(struct bt_conn *conn,
 		return BT_GATT_ERR(BT_ATT_ERR_INVALID_ATTRIBUTE_LEN);
 	}
 	
-	// 解析新间隔值
+	// 解析新的历史记录间隔
 	uint16_t new_interval = sys_get_le16(buf);
 	
-	// 验证范围
-	if (new_interval < MIN_SAMPLE_INTERVAL || new_interval > MAX_SAMPLE_INTERVAL) {
-		printk("[配置] 错误: 间隔值超出范围 (%d，有效范围: %d-%d)\r\n",
-		       new_interval, MIN_SAMPLE_INTERVAL, MAX_SAMPLE_INTERVAL);
+	// 验证范围。下限 60 秒是**容量红线**（65000 条 × 60 秒 = 45.1 天），低于它无法兑现 30 天保留承诺
+	if (new_interval < MIN_HISTORY_INTERVAL || new_interval > MAX_HISTORY_INTERVAL) {
+		printk("[配置] 错误: 历史记录间隔超出范围 (%d，有效范围: %d-%d)\r\n",
+		       new_interval, MIN_HISTORY_INTERVAL, MAX_HISTORY_INTERVAL);
 		return BT_GATT_ERR(BT_ATT_ERR_VALUE_NOT_ALLOWED);
 	}
 	
 	// 更新配置
-	sample_interval = new_interval;
-	printk("[配置] 采集间隔已更新: %d 秒\r\n", sample_interval);
+	history_interval = new_interval;
+	printk("[配置] 历史记录间隔已更新: %d 秒（预计保留 %u 天）\r\n",
+	       history_interval, history_retention_days());
 	
 	// 保存到Flash（立即保存，因为是用户主动操作）
 	save_config(true);
 	
-	// 重启定时器
-	k_timer_stop(&sample_timer);
-	k_timer_start(&sample_timer, K_SECONDS(sample_interval), K_NO_WAIT);
+	// 重置聚合窗口，让新周期立即生效（丢弃当前未满一周期的样本，最多损失 history_interval 秒）
+	// 必须用 realign 而非 reset：周期变了，结算网格要按**新周期重算下一边界**，
+	// 否则 deadline 还停留在旧网格上，改大周期后会立刻结算出一条只覆盖几秒的假记录。
+	// 这里就是"60 秒改 300 秒后，下一条落在最近的 5 分钟边界"的实现点。
+	history_window_realign();
 	
-	// 更新状态特性（通知客户端）
+	// 不再重启采样定时器：采样周期固定 1 秒，与历史记录周期完全解耦。
+	
+	// 更新特性数据并通知客户端（修复：原实现通知的是上次读取留下的旧值）
+	sys_put_le16(history_interval, interval_char_data);
 	bt_gatt_notify(NULL, attr, interval_char_data, sizeof(interval_char_data));
 	
 	return len;
 }
 
 // 当前状态特性数据缓冲区（提前定义，供其他函数使用）
-static uint8_t status_char_data[8];  // 8字节：采集间隔(2) + 记录数(2) + 系统状态(1) + 保留(1) + 固件版本(2)
+//
+// v3 帧格式（12 字节；**向后兼容**：前 7 字节与 v2 布局一致，App 按偏移解析不受影响）：
+//   [0:2]   历史记录间隔（秒）—— v2 语义为"采集间隔"，App 应结合能力标志改名显示
+//   [2:4]   已存储记录条数（截断到 uint16）
+//   [4]     状态位：bit0 已连接 / bit1 时间已同步 / bit2 清空中
+//   [5]     能力标志（v3 新增；v2 固件该字节恒为 0）
+//   [6:8]   固件版本号
+//   [8:10]  采样间隔（v3 新增，恒为 1 秒）
+//   [10:12] 名义预计保留天数（v3 新增）
+#define STATUS_CHAR_LEN 12
+
+/* 状态特性能力标志（byte5）；旧固件该字节为 0，App 据此区分语义 */
+#define CAP_HISTORY_INTERVAL  0x01U  /* 12340021 已改为"历史记录间隔"语义 */
+#define CAP_SAMPLE_FIXED      0x02U  /* 采样固定 1 秒，不可配置 */
+#define CAP_EVENT_RECORDS     0x04U  /* 支持突变/越限事件记录 */
+#define CAP_AVERAGE_RECORDS   0x08U  /* 历史记录为周期均值 */
+#define CAP_WALLCLOCK_ALIGN   0x10U  /* 周期记录时间戳按墙钟边界对齐（60→:00；300→:00/:05/…）*/
+#define CAP_PARTIAL_WINDOW    0x20U  /* 对时后首个窗口可能短于一个周期（保留部分窗口而非丢弃）*/
+
+static uint8_t status_char_data[STATUS_CHAR_LEN];
 
 // 保存状态特性属性指针，供通知使用
 static const struct bt_gatt_attr *status_char_attr = NULL;
+
+// 统一构造状态帧（原先在读回调/采集/清空三处各写一遍，容易漂移）
+static void status_char_build(void)
+{
+	uint32_t stored = storage_get_total_records();
+
+	sys_put_le16(history_interval, &status_char_data[0]);
+	sys_put_le16((uint16_t)MIN(stored, (uint32_t)0xFFFF), &status_char_data[2]);
+	status_char_data[4] = (bt_connected ? 0x01 : 0x00) |
+			      (time_synced ? 0x02 : 0x00) |
+			      (data_clear_in_progress ? 0x04 : 0x00) |
+			      /* bit3：墙钟可信（本次上电收到过手机对时）。
+			       * 仅从 NVS 恢复旧时间时为 0 —— 此时周期记录不按整分网格结算，
+			       * App 不应假定时间戳落在 :00。 */
+			      (wallclock_ready() ? 0x08 : 0x00);
+	status_char_data[5] = CAP_HISTORY_INTERVAL | CAP_SAMPLE_FIXED |
+			      CAP_EVENT_RECORDS | CAP_AVERAGE_RECORDS |
+			      CAP_WALLCLOCK_ALIGN | CAP_PARTIAL_WINDOW;
+	sys_put_le16(firmware_version, &status_char_data[6]);
+	sys_put_le16(SAMPLE_INTERVAL_FIXED, &status_char_data[8]);
+	sys_put_le16(history_retention_days(), &status_char_data[10]);
+}
 
 // 当前状态特性读取回调
 static ssize_t status_char_read_cb(struct bt_conn *conn,
@@ -396,17 +922,7 @@ static ssize_t status_char_read_cb(struct bt_conn *conn,
 		status_char_attr = attr;
 	}
 	
-	// 更新数据
-	sys_put_le16(sample_interval, &status_char_data[0]);
-	// 这里的“记录数”改为实际已存入 Flash 的条数，避免与采样次数混淆
-	uint32_t stored = storage_get_total_records();
-	sys_put_le16((uint16_t)MIN(stored, (uint32_t)0xFFFF), &status_char_data[2]);
-	// 状态字节：bit0=连接状态, bit1=时间同步状态, bit2=清空数据进行中
-	status_char_data[4] = (bt_connected ? 0x01 : 0x00) | 
-			      (time_synced ? 0x02 : 0x00) |
-			      (data_clear_in_progress ? 0x04 : 0x00);
-	status_char_data[5] = 0;  // 保留
-	sys_put_le16(firmware_version, &status_char_data[6]);  // 固件版本号
+	status_char_build();
 	
 	return bt_gatt_attr_read(conn, attr, buf, len, offset,
 				 status_char_data, sizeof(status_char_data));
@@ -628,6 +1144,12 @@ static ssize_t time_char_write_cb(struct bt_conn *conn,
 	time_base_timestamp = timestamp;
 	time_base_uptime = k_uptime_get();  // 获取当前系统运行时间（毫秒）
 	time_synced = true;
+	/* 手机实时对时 → 墙钟可信。**必须重算下一边界**：对时可能把基准往前或往后拨，
+	 * 不重算的话 deadline 还挂在旧网格上，会立刻结算出一条时间戳错乱的记录。
+	 * 顺带这也实现了"对时后立即开始累计，到下一边界出首条记录"。
+	 * 注意：只动聚合窗口与结算网格，**不碰 NVS 写头与已有历史**。 */
+	wall_clock_aligned = true;
+	history_window_realign();
 
 	// 保存时间到 NVS（立即保存，确保重启后能恢复）
 	if (nvs_config_is_ready()) {
@@ -719,11 +1241,28 @@ static ssize_t temp_range_reset_char_write_cb(struct bt_conn *conn,
 
 // ========== 实时数据服务GATT回调函数 ==========
 
-// 实时数据特性数据缓冲区（6字节：温度(2) + 湿度(2) + 气压(2)）
-static uint8_t realtime_char_data[6];
+// 实时数据特性数据缓冲区
+// 基础 6 字节：温度(2) + 湿度(2) + 气压(2)
+// 启用电池电压后**末尾追加** 2 字节小端毫伏 → 8 字节（App 按帧长自动兼容，旧 6 字节不变）
+#ifdef CONFIG_ADC
+#define REALTIME_FRAME_LEN 8
+#else
+#define REALTIME_FRAME_LEN 6
+#endif
+static uint8_t realtime_char_data[REALTIME_FRAME_LEN];
 
 // 保存实时数据特征属性指针，供通知使用
 static const struct bt_gatt_attr *realtime_char_attr = NULL;
+
+/* 把电池电压写进实时帧尾部。
+ * **只读缓存**：绝不在 GATT 回调里调用 adc_read() —— 那会把 ADC 采样与校准
+ * 塞进 BT RX 上下文，既顶高 RX 栈，又长时间阻塞蓝牙接收。 */
+static inline void realtime_fill_voltage(void)
+{
+#ifdef CONFIG_ADC
+	sys_put_le16(vdd_cached_mv(), &realtime_char_data[6]);
+#endif
+}
 
 // 实时数据特性读取回调（返回与通知/存储一致的最新缓存值，不做二次采样）
 // 原因：若在此处重新读传感器，会与定时器采样的“写入/存储”不一致（例如存储 600 hPa，手机读特征得到 1100 hPa）
@@ -774,6 +1313,9 @@ static ssize_t realtime_char_read_cb(struct bt_conn *conn,
 	}
 	uint16_t pressure_dhpa = (uint16_t)p_dhpa_i;
 	sys_put_le16(pressure_dhpa, &realtime_char_data[4]);
+
+	// 电池电压（缓存值，不触发 ADC 采样）
+	realtime_fill_voltage();
 	
 	// 挂起 I2C 设备电源（低功耗）（暂时注释：保持 I2C 常开）
 	// i2c_power_suspend();
@@ -803,7 +1345,7 @@ BT_GATT_SERVICE_DEFINE(config_service,
 			       BT_GATT_CHRC_READ | BT_GATT_CHRC_WRITE,
 			       BT_GATT_PERM_READ | BT_GATT_PERM_WRITE,
 			       interval_char_read_cb, interval_char_write_cb, NULL),
-	BT_GATT_CUD("Sample Interval", BT_GATT_PERM_READ),
+	BT_GATT_CUD("History Record Interval", BT_GATT_PERM_READ),
 	BT_GATT_CHARACTERISTIC(&status_char_uuid.uuid,
 			       BT_GATT_CHRC_READ | BT_GATT_CHRC_NOTIFY,
 			       BT_GATT_PERM_READ,
@@ -881,6 +1423,14 @@ static void clear_data_work_handler(struct k_work *work)
 		ram_buffer_count = 0;
 		printk("[清空数据] 已清空RAM缓冲区\r\n");
 
+		// 重置聚合窗口与事件判定基准，避免清空后立刻用旧基准误判"突变"
+		history_window_reset();
+		last_record_valid = false;
+		alarm_state = 0;
+		last_event_uptime_ms = 0;
+		last_event_seen = false;
+		event_pending_kind = EVENT_KIND_NONE;
+
 		// 提前重置存储位置变量和 NVS，防止擦除过程中断电导致状态不一致
 		// (如果先擦除后重置，中途断电会导致 Flash 已空但 NVS 仍有记录数，出现"有记录无法读取"的现象)
 		next_sector = 0;
@@ -906,10 +1456,8 @@ static void clear_data_work_handler(struct k_work *work)
 		
 		// 发送状态通知（开始清空，status bit 2 = 1）
 		if (bt_ready && bt_connected && status_char_attr != NULL) {
-			// 更新状态位：bit 2 表示清空进行中
-			status_char_data[4] = (bt_connected ? 0x01 : 0x00) | (time_synced ? 0x02 : 0x00) | 0x04;
-			status_char_data[5] = 0;  // 保留
-			sys_put_le16(firmware_version, &status_char_data[6]);  // 固件版本号
+			// data_clear_in_progress 已在写回调中置位，build() 会自动把 bit2 置 1
+			status_char_build();
 			bt_gatt_notify(NULL, status_char_attr, status_char_data, sizeof(status_char_data));
 		}
 	}
@@ -957,17 +1505,17 @@ static void clear_data_work_handler(struct k_work *work)
 	data_clear_in_progress = false;
 	printk("[清空数据] 清空完成，已恢复采集和存储功能\r\n");
 	
-	// 重新启动采集定时器
+	// 重新启动采集定时器（周期定时器，见 sample_start_work_handler）
 	if (bt_ready) {
-		k_timer_start(&sample_timer, K_SECONDS(sample_interval), K_NO_WAIT);
-		printk("[清空数据] 已重新启动采集定时器，间隔: %d 秒\r\n", sample_interval);
+		history_window_realign();   // 清空后重新对齐结算网格（有可信墙钟则落到整分边界）
+		k_timer_start(&sample_timer, K_SECONDS(sample_interval),
+			      K_SECONDS(sample_interval));
+		printk("[清空数据] 已重新启动采样定时器，采样周期: %d 秒\r\n", sample_interval);
 		
 		// 发送状态通知（结束清空，status bit 2 = 0）
 		if (bt_connected && status_char_attr != NULL) {
-			// 更新状态位：bit 2 清零
-			status_char_data[4] = (bt_connected ? 0x01 : 0x00) | (time_synced ? 0x02 : 0x00);
-			status_char_data[5] = 0;  // 保留
-			sys_put_le16(firmware_version, &status_char_data[6]);  // 固件版本号
+			// data_clear_in_progress 已清零，build() 会自动把 bit2 清 0
+			status_char_build();
 			bt_gatt_notify(NULL, status_char_attr, status_char_data, sizeof(status_char_data));
 		}
 	}
@@ -1017,15 +1565,27 @@ static void sample_start_work_handler(struct k_work *work)
 {
 	// 确保蓝牙就绪后再启动采集
 	if (bt_ready) {
-		printk("[采集] 启动采集任务，间隔: %d 秒\r\n", sample_interval);
-		k_work_submit(&sample_work);
+		printk("[采集] 启动采集任务：采样 %d 秒 / 历史记录 %d 秒（预计保留 %u 天）\r\n",
+		       sample_interval, history_interval, history_retention_days());
+
+		/* 起始对齐：把结算网格锚到墙钟边界（有可信墙钟时）或"此刻 + 一个周期"，
+		 * 然后启动**周期**采样定时器。
+		 *
+		 * 周期定时器取代了早期"单次触发 + 工作完成后重武装 1 秒"的写法：
+		 * 后者把真实周期变成 1 秒 + 工作耗时，60 拍实测约 68 秒/条。 */
+		history_window_realign();
+		k_timer_start(&sample_timer, K_SECONDS(sample_interval),
+			      K_SECONDS(sample_interval));
 	}
 }
 
 // 采集定时器回调
 static void sample_timer_handler(struct k_timer *timer)
 {
-	// 唤醒系统，触发采集任务
+	/* 唤醒系统，触发采集任务。
+	 * 注意这是**周期**定时器的回调：若上一拍的 sample_work 仍在执行，
+	 * k_work_submit() 会返回 -EBUSY 并丢弃这一拍 —— 这是刻意的自我保护，
+	 * 且不会破坏记录节奏，因为窗口结算是按 uptime 网格判定的。 */
 	k_work_submit(&sample_work);
 }
 
@@ -1033,6 +1593,7 @@ static void sample_timer_handler(struct k_timer *timer)
 static void sample_work_handler(struct k_work *work)
 {
 	// 检查是否正在清空数据，如果是则停止采集
+	// （定时器在 clear_data_work_handler 里已 k_timer_stop，这里只是防御）
 	if (data_clear_in_progress) {
 		printk("[采集] 清空数据进行中，跳过本次采集\r\n");
 		return;
@@ -1040,7 +1601,9 @@ static void sample_work_handler(struct k_work *work)
 	
 	// 检查蓝牙是否已就绪，避免在蓝牙未初始化时访问 GATT
 	if (!bt_ready) {
-		// 蓝牙未就绪，直接返回（定时器会在蓝牙就绪后由 bt_ready_cb 启动）
+		/* 蓝牙未就绪：停掉周期定时器，避免空转唤醒。
+		 * 采集会在 bt_ready_cb → sample_start_work_handler 里重新启动。 */
+		k_timer_stop(&sample_timer);
 		printk("[采集] 蓝牙未就绪，跳过本次采集\r\n");
 		return;
 	}
@@ -1054,7 +1617,22 @@ static void sample_work_handler(struct k_work *work)
 	int err_aht = aht30_read(&temperature, &humidity);
 	
 	k_msleep(10); // 增加间隔，确保 I2C 总线彻底释放
-	
+
+	/* 窗口节拍在**每个采样节拍**上推进（含 AHT30 读取失败、时间未同步），
+	 * 这样记录节奏恒为 history_interval，不会因间歇性传感器失败而被拉长。
+	 *
+	 * 这里必须放在 `if (err_aht == 0)` **之外**：早期实现把它放在成功分支内，
+	 * 后果是 AHT30 一旦持续失败（实测出现过 I2C 锁死、window_ticks 长期卡在 4），
+	 * 窗口永不推进 → **历史记录整体停摆**。节拍与"有没有有效样本"是两件事。 */
+	if (window_ticks < 0xFFFFU) {
+		window_ticks++;
+	}
+
+	/* 电池电压：同样放在 `if (err_aht == 0)` **之外**，
+	 * 否则 AHT30 一旦失败，电压也会跟着停更（两件事互不相关）。
+	 * 这里跑在系统工作队列上，按 VDD_SAMPLE_PERIOD_S（默认 60 s）节流。 */
+	vdd_periodic_tick();
+
 	if (err_aht == 0) {
 		// 温度和湿度已放大100倍
 		// printk("[AHT30] 温度: %d.%02d°C, 湿度: %d.%02d%%\r\n",
@@ -1065,14 +1643,16 @@ static void sample_work_handler(struct k_work *work)
 		int32_t pressure = 0, spl06_temp = 0;
 		int err_spl = spl06_read(&pressure, &spl06_temp);
 		if (err_spl != 0) {
-			// 气压传感器读取失败，使用默认值（标准大气压 101325 Pa）
-			// 这样即使气压传感器故障，温湿度采集和存储仍能正常工作
-			pressure = 0;  // 标准大气压 Pa
+			// 读取失败：置 0 作为"无效哨兵值"，随后的气压范围校验会把它判定为无效，
+			// 从而**只把气压通道**排除在聚合之外（温湿度照常成记录）。
+			// 注意：原实现注释写"使用默认值 101325 Pa"但代码实际写 0，导致整条记录被丢弃——
+			// 即气压传感器一坏就完全不落盘，此处已改为按通道独立处理。
+			pressure = 0;
 			spl06_temp = 0;
 			// 限制日志打印频率，避免刷屏（每60次打印一次）
 			static int spl06_err_count = 0;
 			if (spl06_err_count++ % 60 == 0) {
-				printk("[SPL06] 读取失败: %d，使用默认气压值 101325 Pa [已发生 %d 次]\r\n", 
+				printk("[SPL06] 读取失败: %d，本拍气压通道不计入聚合 [已发生 %d 次]\r\n", 
 				       err_spl, spl06_err_count);
 			}
 		}
@@ -1113,10 +1693,11 @@ static void sample_work_handler(struct k_work *work)
 		}
 		uint16_t pressure_dhpa = (uint16_t)p_dhpa_i;
 		
-		// 更新实时数据特征：温度(2) + 湿度(2) + 气压(2) = 6字节
+		// 更新实时数据特征：温度(2) + 湿度(2) + 气压(2) [+ 电压(2)]
 		sys_put_le16(temp_value, &realtime_char_data[0]);
 		sys_put_le16(humidity_value, &realtime_char_data[2]);
 		sys_put_le16(pressure_dhpa, &realtime_char_data[4]);
+		realtime_fill_voltage();
 		
 		// 发送实时数据通知（包含温度+湿度+气压）
 		// 注意：如果正在传输历史数据，暂停实时数据通知，避免客户端数据乱序
@@ -1127,86 +1708,69 @@ static void sample_work_handler(struct k_work *work)
 				       realtime_char_data, sizeof(realtime_char_data));
 		}
 		
-		// 更新记录数（简化实现）
-		record_count++;
-		
-		// 存储到 Flash 缓冲区（温湿度 + 气压）
-		// 条件：AHT30 成功 且 时间已同步。与蓝牙是否连接无关（连接/未连接都会写）
-		// 若“连接后不写数据”，多半是 time_synced 仍为 false：需手机端在连接后写入“时间同步”特性
-		// 气压传感器失败时使用默认值（101325 Pa），仍然存储数据
-		if (err_aht == 0 && time_synced) {
-			// 数据有效性校验
-			bool data_valid = true;
-			
-			// 1. 校验温度范围 (-50.00°C ~ 150.00°C)
-			if (temperature < -5000 || temperature > 15000) {
-				printk("[存储] 警告: 温度数据异常 (%d)，忽略此记录\r\n", temperature);
-				data_valid = false;
+		// ================= 历史记录：聚合 / 事件 / 落盘（D-2）=================
+		// 与蓝牙是否连接无关（连接/未连接都会记录）；仅要求时间已同步，否则时间戳无意义。
+		// 条件：AHT30 成功。若“连接后不写数据”，多半是 time_synced 仍为 false：
+		//       需手机端在连接后写入“时间同步”特性。
+		{
+			// 逐通道有效性校验（不再"一票否决"整条记录）
+			bool t_ok = (temperature >= -5000 && temperature <= 15000);   // -50.00~150.00°C
+			bool h_ok = (humidity >= 0 && humidity <= 10000);              // 0.00~100.00%RH
+			bool p_ok = (pressure >= 10000 && pressure <= 200000);         // 100~2000 hPa
+
+			if (!t_ok) {
+				printk("[存储] 警告: 温度数据异常 (%d)，本拍温度通道不计入聚合\r\n",
+				       (int)temperature);
 			}
-			
-			// 2. 校验湿度范围 (0.00% ~ 100.00%)
-			if (humidity < 0 || humidity > 10000) {
-				printk("[存储] 警告: 湿度数据异常 (%d)，忽略此记录\r\n", humidity);
-				data_valid = false;
+			if (!h_ok) {
+				printk("[存储] 警告: 湿度数据异常 (%d)，本拍湿度通道不计入聚合\r\n",
+				       (int)humidity);
 			}
-			
-			// 3. 校验气压范围 (300hPa ~ 1200hPa -> 30000Pa ~ 120000Pa)
-			// 考虑到极端环境，放宽到 100hPa ~ 2000hPa
-			if (pressure < 10000 || pressure > 200000) {
-				printk("[存储] 警告: 气压数据异常 (%d Pa)，忽略此记录\r\n", pressure);
-				data_valid = false;
+			if (!p_ok && pressure != 0) {
+				printk("[存储] 警告: 气压数据异常 (%d Pa)，本拍气压通道不计入聚合\r\n",
+				       (int)pressure);
 			}
 
-			// pressure_centihpa = Pa（直接存储Pa值，单位0.01hPa）
-			// Pa值范围通常在80000-120000之间，用uint32_t存储足够
-			uint32_t pressure_centihpa = (uint32_t)pressure;
-			uint32_t current_time = get_current_timestamp();
-			
-			// 再次检查时间戳是否有效（双重保险）
-			if (current_time == 0) {
-				printk("[存储] 警告: 时间未同步，跳过数据存储 (T:%d, H:%u, P:%u)\r\n",
-				       temperature, humidity, pressure_centihpa);
-			} else if (data_valid) {
-				if (ram_buffer_count < RAM_BUFFER_SIZE) {
-					ram_buffer[ram_buffer_count].timestamp = current_time;
-					ram_buffer[ram_buffer_count].temperature = (int16_t)temperature;
-					ram_buffer[ram_buffer_count].humidity = (uint16_t)humidity;
-					ram_buffer[ram_buffer_count].pressure_centihpa = pressure_centihpa;
-					ram_buffer_count++;
-					
-					printk("[存储] 缓冲区: %d/%d 条记录 (时间戳: %u, T:%d, H:%u, P:%u(0.01hPa))\r\n",
-					       ram_buffer_count, RAM_BUFFER_SIZE,
-					       ram_buffer[ram_buffer_count - 1].timestamp,
-					       ram_buffer[ram_buffer_count - 1].temperature,
-					       ram_buffer[ram_buffer_count - 1].humidity,
-					       ram_buffer[ram_buffer_count - 1].pressure_centihpa);
-					
-					if (ram_buffer_count >= RAM_BUFFER_SIZE) {
-						// 缓冲区满，立即写入Flash
-						printk("[存储] 缓冲区已满，开始写入Flash...\r\n");
-						storage_write_batch();
-					}
-				} else {
-					printk("[存储] 警告: 缓冲区已满 (%d/%d)，历史数据可能丢失\r\n",
-					       ram_buffer_count, RAM_BUFFER_SIZE);
+			if (time_synced) {
+				if (t_ok) {
+					acc_temp_sum += temperature;
+					acc_temp_n++;
+				}
+				if (h_ok) {
+					acc_hum_sum += (uint32_t)humidity;
+					acc_hum_n++;
+				}
+				if (p_ok) {
+					acc_press_sum += (uint32_t)pressure;
+					acc_press_n++;
+					last_valid_pressure_pa = (uint32_t)pressure;
+				}
+
+				/* 事件记录：突变/越限时立即追加一条瞬时记录（需温度通道有效） */
+				if (t_ok) {
+					uint32_t ev_hum = h_ok
+						? (uint32_t)humidity
+						: (uint32_t)(last_record_valid ? last_record_hum : 0U);
+					uint32_t ev_press = p_ok
+						? (uint32_t)pressure
+						: (last_valid_pressure_pa ? last_valid_pressure_pa : 101325U);
+					history_maybe_event(temperature, ev_hum, ev_press,
+							    get_current_timestamp());
 				}
 			}
-		} else if (err_aht == 0 && !time_synced) {
-			// 传感器读取成功但时间未同步，不存储数据（连接后不写数据通常因此：请确保 APP 连接后下发时间同步）
-			static int no_sync_log_count = 0;
-			if (no_sync_log_count++ % 60 == 0) {
-				printk("[存储] 时间未同步，跳过数据存储 (请 APP 连接后写入时间同步特性) [已拦截 %d 次]\r\n", no_sync_log_count);
+
+			if (!time_synced) {
+				static int no_sync_log_count = 0;
+				if (no_sync_log_count++ % 60 == 0) {
+					printk("[存储] 时间未同步，本拍不聚合 (请 APP 连接后写入时间同步特性) [已拦截 %d 次]\r\n",
+					       no_sync_log_count);
+				}
 			}
 		}
 		
 		// 更新状态特性（通知客户端）- 仅在蓝牙就绪时
 		if (bt_ready) {
-			sys_put_le16(sample_interval, &status_char_data[0]);
-			uint32_t stored = storage_get_total_records();
-			sys_put_le16((uint16_t)MIN(stored, (uint32_t)0xFFFF), &status_char_data[2]);
-			status_char_data[4] = (bt_connected ? 0x01 : 0x00) | (time_synced ? 0x02 : 0x00);
-			status_char_data[5] = 0;  // 保留
-			sys_put_le16(firmware_version, &status_char_data[6]);  // 固件版本号
+			status_char_build();
 			
 			// 发送配置状态通知（如果已连接）
 			// 注意：实际应该检查CCC状态，这里简化实现
@@ -1234,14 +1798,31 @@ static void sample_work_handler(struct k_work *work)
 	} else {
 		printk("[AHT30] 读取失败: %d\r\n", err_aht);
 	}
-	
+
+	/* 窗口到期 → 生成一条周期均值记录（内部立即落盘）。
+	 *
+	 * 判定用 **uptime 绝对网格**（history_window_due），不是"数够 history_interval 个节拍"：
+	 * 工作队列忙时 k_work_submit 会丢掉那一拍，数节拍会让周期被拉长；按 uptime 结算则
+	 * 无论丢不丢拍，每个周期都恰好是 history_interval 秒。
+	 *
+	 * 同样放在 AHT30 成功分支**之外**：本拍即使读失败，只要到期就照常结算
+	 * （`history_commit_average()` 会在无有效温度样本时自行跳过并重置窗口）。
+	 * deadline 无条件推进——即便本窗口一条有效样本都没有，"真实分钟边界"也不能被破坏。 */
+	if (history_window_due()) {
+		history_commit_average();
+		history_window_advance_deadline();
+	}
+
+	/* 上一拍落盘失败的记录，本拍继续重试（不产生新记录） */
+	if (ram_buffer_count > 0U) {
+		history_flush_buffer();
+	}
+
 	// 挂起 I2C 设备电源（低功耗优化）（暂时注释：保持 I2C 常开）
 	// i2c_power_suspend();
-	
-	// 设置下次唤醒（仅在蓝牙就绪时启动定时器）
-	if (bt_ready) {
-		k_timer_start(&sample_timer, K_SECONDS(sample_interval), K_NO_WAIT);
-	}
+
+	/* 这里**不再重武装定时器**：sample_timer 已是周期定时器（见 sample_start_work_handler）。
+	 * 早期在函数末尾 k_timer_start(..., K_NO_WAIT) 的写法会让周期 = 1 s + 本函数耗时。 */
 }
 
 // 蓝牙连接回调函数
@@ -1330,7 +1911,7 @@ static void bt_ready_cb(int err)
 	printk("  湿度特性 UUID: 12340003-1234-5678-1234-56789ABCDEF0 (可读/可通知)\r\n");
 	printk("配置服务已注册\r\n");
 	printk("  服务 UUID: 12340020-1234-5678-1234-56789ABCDEF0\r\n");
-	printk("  采集间隔特性 UUID: 12340021-1234-5678-1234-56789ABCDEF0\r\n");
+	printk("  历史记录间隔特性 UUID: 12340021-1234-5678-1234-56789ABCDEF0 (读写, 60~3600秒；采样固定1秒)\r\n");
 	printk("  当前状态特性 UUID: 12340022-1234-5678-1234-56789ABCDEF0\r\n");
 	printk("  历史数据特性 UUID: 12340023-1234-5678-1234-56789ABCDEF0 (通知)\r\n");
 	printk("  历史记录信息特性 UUID: 12340026-1234-5678-1234-56789ABCDEF0 (读取)\r\n");
@@ -1348,7 +1929,8 @@ static void bt_ready_cb(int err)
 	
 	// 延迟启动第一次采集任务（确保系统完全稳定）
 	// 注意：在回调函数中直接提交工作队列可能不安全，使用延迟工作队列
-	printk("[采集] 蓝牙已就绪，1秒后启动采集任务，间隔: %d 秒\r\n", sample_interval);
+	printk("[采集] 蓝牙已就绪，1秒后启动采集任务：采样 %d 秒 / 历史记录 %d 秒\r\n",
+	       sample_interval, history_interval);
 	k_work_schedule(&sample_start_work, K_SECONDS(1));
 }
 
@@ -1585,6 +2167,20 @@ static int storage_init(void)
 	return 0;
 }
 
+/* 写入中断时，把缓冲区中"尚未写入"的记录（从索引 written 起）前移，等待下一拍重试。
+ * 写头 next_record_in_sector 只在写入成功后推进，因此重试会从同一地址继续；
+ * 这使 5 条 RAM 缓冲真正成为"Flash 临时失败的重试区"，而不是丢了就算了。 */
+static void storage_keep_unwritten(uint16_t written, uint16_t nr)
+{
+	uint16_t left = (uint16_t)(nr - written);
+
+	if (written > 0U && left > 0U) {
+		memmove(&ram_buffer[0], &ram_buffer[written],
+			(size_t)left * sizeof(ram_buffer[0]));
+	}
+	ram_buffer_count = (uint8_t)left;
+}
+
 // 批量写入数据到 W25Q64（环形扇区）
 // 策略：平时只管写；写完一个扇区才擦下一个（跨扇区时强制 Sector Erase）。无 Read-before-Write，无 0xFF 检查。
 // 低功耗：唤醒 -> 操作 -> 睡眠。按页边界分块写入，避免跨页 partial program。
@@ -1605,10 +2201,10 @@ static void storage_write_batch(void)
 		return;
 	}
 	
-	// 检查时间同步状态，确保所有数据都有有效时间戳
+	// 时间未同步时不落盘，但**保留**缓冲数据（等时间同步后补写），不再直接丢弃
 	if (!time_synced) {
-		printk("[存储] 错误: 时间未同步，清空缓冲区，不写入Flash (共 %d 条记录)\r\n", ram_buffer_count);
-		ram_buffer_count = 0;
+		printk("[存储] 时间未同步，保留 %d 条记录在缓冲区等待补写\r\n",
+		       ram_buffer_count);
 		return;
 	}
 	
@@ -1641,9 +2237,9 @@ static void storage_write_batch(void)
 		}
 		
 		// 4. 检查气压 (10000 ~ 200000)
-		if (ram_buffer[i].pressure_centihpa < 10000 || ram_buffer[i].pressure_centihpa > 200000) {
+		if (ram_buffer[i].pressure_pa < 10000 || ram_buffer[i].pressure_pa > 200000) {
 			printk("[存储] 警告: 发现无效气压记录 (%u, 索引 %d)，已过滤\r\n", 
-			       ram_buffer[i].pressure_centihpa, i);
+			       ram_buffer[i].pressure_pa, i);
 			is_valid = false;
 		}
 
@@ -1695,6 +2291,8 @@ static void storage_write_batch(void)
 			next_record_in_sector = 0;
 			// 更新扇区基地址
 			sector_base = W25Q64_STORAGE_BASE + next_sector * W25Q64_SECTOR_SIZE;
+			// 写头跨扇区：调用方据此立即把写头持久化到 NVS
+			sector_switched_flag = true;
 		}
 
 		/* 如果在扇区起始位置，强制擦除（确保新扇区干净） */
@@ -1727,15 +2325,15 @@ static void storage_write_batch(void)
 
 		ret = w25q64_page_program(write_addr, (const uint8_t *)&ram_buffer[written], chunk_len);
 		if (ret != 0) {
-			printk("[存储] 页编程失败: %d\r\n", ret);
-			ram_buffer_count = 0;
+			printk("[存储] 页编程失败: %d，保留 %d 条待重试\r\n", ret, nr - written);
+			storage_keep_unwritten(written, nr);
 			w25q64_sleep();
 			goto out_unlock;
 		}
 		ret = w25q64_wait_ready();
 		if (ret != 0) {
-			printk("[存储] 等待就绪失败: %d\r\n", ret);
-			ram_buffer_count = 0;
+			printk("[存储] 等待就绪失败: %d，保留 %d 条待重试\r\n", ret, nr - written);
+			storage_keep_unwritten(written, nr);
 			w25q64_sleep();
 			goto out_unlock;
 		}
@@ -2223,7 +2821,7 @@ static void history_send_work_handler(struct k_work *work)
 		
 		// 检查数据是否全0（可能是未初始化的数据）
 		// 注意：这个检查已经在前面处理过timestamp==0的情况，这里作为额外安全检查
-		if (rec.timestamp == 0 && rec.temperature == 0 && rec.humidity == 0 && rec.pressure_centihpa == 0) {
+		if (rec.timestamp == 0 && rec.temperature == 0 && rec.humidity == 0 && rec.pressure_pa == 0) {
 			// 全0数据，跳过（已在前面检查过timestamp==0，这里作为额外检查）
 			// 注意：records_scanned已经在前面增加了，这里不需要再次增加
 			continue;
@@ -2240,26 +2838,9 @@ static void history_send_work_handler(struct k_work *work)
 		}
 		
 		// 检查气压范围 (100hPa ~ 2000hPa -> 10000Pa ~ 200000Pa)
-		if (rec.pressure_centihpa < 10000 || rec.pressure_centihpa > 200000) {
+		if (rec.pressure_pa < 10000 || rec.pressure_pa > 200000) {
 			data_valid = false;
 		}
-		
-		// 额外检查：如果湿度或气压值异常大（可能是地址错位），即使通过了范围检查也要标记为异常
-		// 例如：湿度27001（270.01%）或气压值>1000000（10000hPa）明显异常
-		// 注意：正常湿度范围是0-100%，即0-10000（0.01%单位），如果>6553（65.53%）但<10000，可能是传感器异常
-		// 如果>10000，已经在前面检查过了，这里主要检查异常大的值（可能是地址错位导致读取了错误位置的数据）
-		// if (rec.humidity > 6553 || rec.pressure_centihpa > 1000000) {
-		// 	printk("[历史] 警告: 数据值异常大，可能是地址错位 (湿度:%u, 气压:%u)，跳过此记录 (扇区:%d, 记录索引:%d, 时间戳:%u)\r\n",
-		// 	       rec.humidity, rec.pressure_centihpa, history_transfer_sector, history_transfer_record_idx + records_scanned - 1, rec.timestamp);
-		// 	data_valid = false;
-		// }
-		
-		// // 数据一致性检查：如果温度、湿度、气压都是0，但时间戳不为0，可能是数据损坏
-		// if (rec.timestamp != 0 && rec.temperature == 0 && rec.humidity == 0 && rec.pressure_centihpa == 0) {
-		// 	printk("[历史] 警告: 数据一致性异常 (时间戳:%u但其他数据全0)，跳过此记录 (扇区:%d, 记录索引:%d)\r\n",
-		// 	       rec.timestamp, history_transfer_sector, history_transfer_record_idx + records_scanned - 1);
-		// 	data_valid = false;
-		// }
 		
 		if (!data_valid) {
 			// 数据异常，跳过此记录
@@ -2403,7 +2984,8 @@ int main(void)
 	// 立即输出测试信息，验证串口是否工作
 	printk("\r\n\r\n");
 	printk("=== 系统启动 ===\r\n");
-	printk("[固件] 版本号: %d\r\n", FIRMWARE_VERSION);
+	printk("[固件] 版本: %s（patch=%d，来自工程根 VERSION 文件）\r\n",
+	       FIRMWARE_VERSION_STRING, FIRMWARE_VERSION);
 
 	int err;
 	
@@ -2417,6 +2999,17 @@ int main(void)
 	// NVS 初始化（配置 + W25Q64 位置，存芯片 FLASH）
 	(void)nvs_config_init();
 	load_config();
+
+	/* OTA 服务的 GATT 是静态定义，这里只复位状态机。
+	 * 必须放在 NVS 之后：断点续传状态要读写 NVS。 */
+	ble_ota_init();
+
+#ifdef CONFIG_ADC
+	/* 电池电压：SAADC 内部 VDD 通道，零外部电路。
+	 * 上电先采一次，手机连上后立刻就能看到电压（否则要等一个采样周期）。
+	 * 此处仍在蓝牙启动之前 —— 避开 TX 突发导致的瞬时跌落，读数更接近静态电池电压。 */
+	vdd_refresh();
+#endif
 	
 	if (max_temperature != INT16_MIN) {
 		printk("[配置] 当前最高温度: %d.%02d°C (时间戳: %u)\r\n",
@@ -2451,6 +3044,11 @@ int main(void)
 			time_base_uptime = k_uptime_get();
 			time_synced = true;
 		}
+		/* 无论恢复成功与否，都**不宣称**墙钟对齐：恢复出来的是上次对时的旧值，
+		 * 停机期间秒数停走，它必然偏慢。要等**本次上电**收到手机对时才算可信
+		 * （届时由 time_char_write_cb 置位并重算边界）。
+		 * 在此之前周期记录退回"严格等间隔 + 真实秒"，不按整分网格造"看起来对齐"的时间戳。 */
+		wall_clock_aligned = false;
 	}
 	int storage_err = storage_init();
 	if (storage_err != 0) {

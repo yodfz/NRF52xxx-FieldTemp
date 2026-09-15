@@ -1,0 +1,33 @@
+# ---- 构建产物 ----
+build/
+build-*/
+*.log
+
+# ---- Python 缓存 ----
+__pycache__/
+*.py[cod]
+
+# ---- 本机生成的分析报告 ----
+ram_report.txt
+rom_report.txt
+
+# ---- 密钥材料：绝不入库 ----
+# OTA 授权密钥头（由 src/ble/ota_auth_key.h.example 复制而来，见该文件说明）
+src/ble/ota_auth_key.h
+
+# MCUboot 签名私钥。刻意**不**粗暴忽略所有 *.pem：
+# 将来若需要把 MCUboot **公钥**（.pem，非凭据）入库，粗暴规则会把它一起挡掉。
+# 因此这里按目录与文件名精确匹配。
+keys/
+root-ec-p256.pem
+*-priv.pem
+*private*.pem
+*.key
+*.p12
+*.pfx
+*.jks
+*.keystore
+
+# 公钥（非凭据）允许入库：命名成 *-pub.pem / *-public.pem 即可
+!*-pub.pem
+!*-public.pem

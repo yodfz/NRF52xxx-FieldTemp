@@ -5,8 +5,8 @@
 本文档记录 E104-BT5010A 开发板的 GPIO 引脚分配情况。
 
 - MCU: nRF52810
-- Flash: 194KB
-- RAM: 24KB
+- Flash: 192 KiB
+- RAM: 24 KiB
 
 ## 引脚配置架构
 

@@ -18,7 +18,7 @@ extern "C" {
 /* ========== LED 指示灯引脚 ========== */
 /* LED 为低电平有效（低电平点亮，高电平熄灭）*/
 #define PIN_LED_DATA       4   /* P0.4 - 数据指示灯 */
-#define PIN_LED_LINK       19   /* P0.5 - 蓝牙连接指示灯 */
+#define PIN_LED_LINK       5    /* P0.5 - 蓝牙连接指示灯 */
 
 /* ========== I2C0 传感器总线引脚 ========== */
 /* 连接设备: AHT30/SHT40 温湿度传感器, SPL06 气压传感器, LTR-390UV 紫外线传感器 */
@@ -58,7 +58,7 @@ extern "C" {
 /* ========== 硬件版本标识 ========== */
 #define BOARD_NAME         "E104-BT5010A"
 #define BOARD_VERSION      "1.1.3"
-#define MCU_MODEL          "nRF52832"
+#define MCU_MODEL          "nRF52810"
 
 #ifdef __cplusplus
 }

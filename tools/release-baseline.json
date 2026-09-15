@@ -1,0 +1,5 @@
+{
+  "version": "1.0.3",
+  "note": "v4：通过 DFU 端到端验证并烧入主槽的最后一个版本（build-v4，手工签名产物 zephyr.signed.v4.bin 的 ih_ver = 1.0.3+0）",
+  "updated": "2026-09-12"
+}

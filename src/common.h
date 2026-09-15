@@ -24,7 +24,7 @@ struct data_record {
 	uint32_t timestamp;          /* Unix时间戳（秒）*/
 	int16_t temperature;         /* 温度（0.01°C）*/
 	uint16_t humidity;           /* 湿度（0.01%RH）*/
-	uint32_t pressure_centihpa;  /* 气压（Pa，单位0.01hPa）*/
+	uint32_t pressure_pa;          /* 气压（Pa）*/
 } __packed;
 
 /**

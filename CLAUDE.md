@@ -22,7 +22,7 @@
 # 工程指导
 
 - 可以参考 RIOT-2020.10-RC3-boards-e104-bt5010a-tb 文件夹下代码实现
-- 系统板子是 E104-BT5010A 194KB FLASH 24K RAM
+- 系统板子是 E104-BT5010A（nRF52810，192 KiB Flash / 24 KiB RAM）
 - ncs 3.2.1
 - 你需要用中文回答问题
 
@@ -34,6 +34,6 @@ DATA 灯 4
 ## W25Q64
 
 CS 28
-DO 29
-SLK 30
-DI 31
+DO 29 (MISO)
+SCK 30
+DI 31 (MOSI)

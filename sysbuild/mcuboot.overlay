@@ -1,0 +1,47 @@
+/ {
+	chosen {
+		nordic,pm-ext-flash = &w25q64;
+	};
+};
+
+&pinctrl {
+	spi0_default_mcuboot: spi0_default_mcuboot {
+		group1 {
+			psels = <NRF_PSEL(SPIM_SCK, 0, 30)>,
+			        <NRF_PSEL(SPIM_MOSI, 0, 31)>,
+			        <NRF_PSEL(SPIM_MISO, 0, 29)>;
+			bias-pull-down;
+		};
+	};
+
+	spi0_sleep_mcuboot: spi0_sleep_mcuboot {
+		group1 {
+			psels = <NRF_PSEL(SPIM_SCK, 0, 30)>,
+			        <NRF_PSEL(SPIM_MOSI, 0, 31)>,
+			        <NRF_PSEL(SPIM_MISO, 0, 29)>;
+			low-power-enable;
+			bias-pull-down;
+		};
+	};
+};
+
+&spi0 {
+	compatible = "nordic,nrf-spim";
+	status = "okay";
+	pinctrl-0 = <&spi0_default_mcuboot>;
+	pinctrl-1 = <&spi0_sleep_mcuboot>;
+	pinctrl-names = "default", "sleep";
+	cs-gpios = <&gpio0 28 GPIO_ACTIVE_LOW>;
+
+	w25q64: w25q64@0 {
+		compatible = "jedec,spi-nor";
+		status = "okay";
+		reg = <0>;
+		spi-max-frequency = <4000000>;
+		size = <0x4000000>;
+		jedec-id = [ef 40 17];
+		/* A soft reset does not wake a W25Q64 left in deep power-down. */
+		has-dpd;
+		t-exit-dpd = <3000>;
+	};
+};

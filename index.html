@@ -1394,7 +1394,7 @@
               }
 
               // 解析数据包（小端序）
-              // 每条记录12字节：timestamp(4) + temp(2) + hum(2) + pressure_centihpa(4)
+              // 每条记录12字节：timestamp(4) + temp(2) + hum(2) + pressure_pa(4)
               const buffer = new DataView(dataView.buffer);
               let offset = 0;
               let recordsInPacket = 0;

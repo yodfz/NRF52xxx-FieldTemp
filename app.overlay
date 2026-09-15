@@ -1,3 +1,6 @@
+/* NRF_SAADC_VDD 等 SAADC 输入宏（电池电压采样用） */
+#include <zephyr/dt-bindings/adc/nrf-saadc.h>
+
 / {
 	aliases {
 		/* W25Q64 使用此 SPI；52832 overlay 会覆盖为 &spi1 */
@@ -6,6 +9,11 @@
 	chosen {
 		zephyr,console = &uart0;
 		zephyr,shell-uart = &uart0;
+		nordic,pm-ext-flash = &w25q64;
+	};
+	zephyr,user {
+		/* 通道 0 = 电池电压（见文件末尾 &adc） */
+		io-channels = <&adc 0>;
 	};
 };
 
@@ -49,6 +57,34 @@
 			bias-pull-up;
 		};
 	};
+
+	/*
+	 * W25Q64 SPI0 pinctrl: SCK=P0.30, MOSI=P0.31, MISO=P0.29.
+	 *
+	 * These states MUST live in this file.  Zephyr's
+	 * configuration_files.cmake stops looking for `app.overlay` as soon as
+	 * it finds a matching `boards/<board>_<soc>.overlay`, so SPI0 used to
+	 * silently fall back to the nRF52 DK defaults (SCK=P0.29, MISO=P0.30,
+	 * no cs-gpios) whenever the pin config was moved into boards/.
+	 */
+	spi0_default_custom: spi0_default_custom {
+		group1 {
+			psels = <NRF_PSEL(SPIM_SCK, 0, 30)>,
+			        <NRF_PSEL(SPIM_MOSI, 0, 31)>,
+			        <NRF_PSEL(SPIM_MISO, 0, 29)>;
+			bias-pull-down;
+		};
+	};
+
+	spi0_sleep_custom: spi0_sleep_custom {
+		group1 {
+			psels = <NRF_PSEL(SPIM_SCK, 0, 30)>,
+			        <NRF_PSEL(SPIM_MOSI, 0, 31)>,
+			        <NRF_PSEL(SPIM_MISO, 0, 29)>;
+			low-power-enable;
+			bias-pull-down;
+		};
+	};
 };
 
 &uicr {
@@ -65,10 +101,59 @@
 	/delete-property/ zephyr,pm-device-runtime-auto;
 };
 
-/* SPI0 已移至板级 overlay：nrf52810/e104_bt5010a_tb 用 spi0，52832 用 spi1 且不启用 spi0 */
+/* SPI0 - W25Q64 Flash（nRF52810 只有一组 SPI，与 I2C 不冲突）
+ * 注意：引脚与 CS 必须写在本文件内，原因见上方 spi0_default_custom 的注释。
+ * nRF52832 变体走 boards/nrf52832dk_nrf52832_cpuapp.overlay 的 spi1，spi0 保持 disabled。
+ */
 
-&adc {
+&spi0 {
+	status = "okay";
+	compatible = "nordic,nrf-spim";
+	pinctrl-0 = <&spi0_default_custom>;
+	pinctrl-1 = <&spi0_sleep_custom>;
+	pinctrl-names = "default", "sleep";
+	cs-gpios = <&gpio0 28 GPIO_ACTIVE_LOW>;
 	/delete-property/ zephyr,pm-device-runtime-auto;
+
+	w25q64: w25q64@0 {
+		compatible = "jedec,spi-nor";
+		status = "okay";
+		reg = <0>;
+		spi-max-frequency = <4000000>;
+		size = <0x4000000>;
+		jedec-id = [ef 40 17];
+		/* A soft reset does not wake a W25Q64 left in deep power-down.
+		 * Keep this in sync with sysbuild/mcuboot.overlay.
+		 */
+		has-dpd;
+		t-exit-dpd = <3000>;
+	};
+};
+
+/*
+ * 电池电压采样：SAADC 内部 VDD 通道，**不需要任何外部电路**。
+ *
+ * 板子没有电压分压/采样电路，但 nRF52810 的 SAADC 能直接测 VDD：
+ *   内部基准 0.6 V + 增益 1/6 → 量程 3.6 V（覆盖模块工作电压 1.7~3.6 V）
+ *   换算：mV = raw * 3600 / 4096（12 bit，见 src/vdd.c）
+ * 前提：VCC 直接由电池供电（无 LDO/稳压），否则测到的是稳压值而非电池电压。
+ *
+ * 驱动在每次转换完成后会 nrfy_saadc_disable()，空闲不耗电。
+ */
+&adc {
+	status = "okay";
+	/delete-property/ zephyr,pm-device-runtime-auto;
+	#address-cells = <1>;
+	#size-cells = <0>;
+
+	channel@0 {
+		reg = <0>;
+		zephyr,gain = "ADC_GAIN_1_6";
+		zephyr,reference = "ADC_REF_INTERNAL";
+		zephyr,acquisition-time = <ADC_ACQ_TIME_DEFAULT>;
+		zephyr,input-positive = <NRF_SAADC_VDD>;
+		zephyr,resolution = <12>;
+	};
 };
 
 &flash_controller {
@@ -79,7 +164,7 @@
 	status = "okay";
 	/delete-property/ zephyr,pm-device-runtime-auto;
 
-	/* 删除默认分区配置，防止标签冲突 */
+	/* MCUboot + PM 布局：内部只保留 primary app，不再放 NVS */
 	/delete-node/ partitions;
 
 	partitions {
@@ -87,18 +172,10 @@
 		#address-cells = <1>;
 		#size-cells = <1>;
 
-		/* Application (0x0 - 0x2A000: 168KB) */
-		slot0_partition: partition@0 {
+		/* Primary app (0x8200 - 0x30000) */
+		slot0_partition: partition@8200 {
 			label = "image-0";
-			reg = <0x00000000 0x0002A000>;
+			reg = <0x00008200 0x00027E00>;
 		};
-
-		/* NVS Storage (0x2A000 - 0x2D000: 12KB) */
-		nvs_partition: partition@2a000 {
-			label = "nvs_storage";
-			reg = <0x0002A000 0x00003000>;
-		};
-
-		/* Reserved for Config (0x2F000 - 0x30000: 4KB) - Used by main.c raw flash access */
 	};
 };

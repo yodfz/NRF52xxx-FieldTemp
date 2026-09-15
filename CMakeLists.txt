@@ -24,10 +24,14 @@ target_sources(app PRIVATE
 target_sources(app PRIVATE 
     src/ble/ble_adv.c
     src/ble/ble_services.c
+    src/ble/ble_ota.c
 )
 
 # LED模块
 target_sources(app PRIVATE src/led.c)
+
+# 电池电压采样（仅 CONFIG_ADC=y 时产生代码，默认关闭 → 对发布镜像零影响）
+target_sources(app PRIVATE src/vdd.c)
 
 # 添加包含目录
 target_include_directories(app PRIVATE src)
