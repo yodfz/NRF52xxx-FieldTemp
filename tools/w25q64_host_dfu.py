@@ -6,9 +6,8 @@ Host-driven W25Q64 programmer for NRF52xxx-FieldTemp (nRF52810 + E104-BT5010A-TB
 What this is for
 ----------------
 The MCUboot secondary slot lives in external SPI flash (W25Q64 @ 0x000000,
-160 KiB), but the application firmware has no DFU transport yet (no mcumgr/SMP,
-no shell) and there is only ~7 KiB of internal flash headroom.  This tool
-sidesteps both problems: it drives the on-board W25Q64 directly from the host
+160 KiB). Normal updates now use the custom BLE OTA transport. This maintenance
+tool provides SWD staging and recovery without the BLE connection: it drives the on-board W25Q64 directly from the host
 over SWD by poking the nRF52810 SPIM0 registers while the core is halted, so a
 signed update image can be staged into the secondary slot without touching the
 application at all.

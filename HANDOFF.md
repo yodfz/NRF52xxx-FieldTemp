@@ -14,7 +14,7 @@
 | Android App 用途 | 设备端配套客户端：BLE 连接与自动重连、实时数据展示、历史同步与曲线、设备配置、固件 OTA 升级界面；另有若干工具箱功能（营地助手、营地回溯、天气模块） |
 | 固件仓库（本地） | `C:\Users\linckr\NRF52xxx-FieldTemp` |
 | 固件仓库（远端） | `https://github.com/linckr/NRF52xxx-FieldTemp`（`upstream` = `https://github.com/yodfz/NRF52xxx-FieldTemp`） |
-| App 仓库（本地） | `C:\Users\linckr\Documents\Codex\2026-09-08\referenced-chatgpt-conversation-this-is-an\PandaThemperature-Android` |
+| App 源码（本地） | `C:\Users\linckr\NRF52xxx-FieldTemp\android`（统一项目）；独立仓库用于上游回传 |
 | App 仓库（远端） | `https://github.com/linckr/PandaThemperature-Android`（`upstream` = `https://github.com/yodfz/PandaThemperature-Android`） |
 | 硬件型号 | 模组 **E104-BT5010A**（亿佰特） |
 | MCU | **nRF52810**（QFAA，Cortex-M4 @ 64 MHz，192 KiB Flash / 24 KiB RAM） |
@@ -27,6 +27,24 @@
 ---
 
 ## 2. 当前真实状态
+
+### 2026-10-09 P2 / 3000 条保留：真机升级、回读与冷启动持久性通过，最新Live回归通过
+
+源码版本为 `1.0.9+0`。历史 Flash 仍是 12 B/条；新增电压采用自识别 packed 存储字，
+旧数据不迁移。状态能力位 `0x40` + 历史请求尾字节 `03` 才启用 14 B BLE 回传，
+旧 4 B 请求保持 12 B。能力位 `0x80` + `[3000 LE32, 04]` 用于持续保留最近 3000 条，
+只写 HISTORY `12340023`，绝不能写 CLEAR `12340041`。字段与安全顺序见 PROTOCOL §3。
+
+完整原始数据已只读归档到本机，SWD 已识别；归档、数据库、凭据和私钥不入 Git。
+开发签名 sysbuild / 尺寸门禁通过：App Flash **151,540 / 163,328 B**（增加 2,012 B），
+签名镜像 **152,203 B**；RAM **23,080 / 24,576 B**（增加 128 B，余 **1,496 B**）；
+MCUboot **31,876 / 32,768 B**（余 **892 B**）。相对 6 KiB 签名镜像预留红线余 **5,493 B**。
+所有分区地址及容量未变。真实生产 C 函数的 native fixture 为 **0 failures**，Android **124** 项
+单元测试通过；生产签名 APK 已验签。开发信任链新固件已真机运行并有主槽逐字节匹配证据；生产信任链尚未部署。
+
+已完成开发信任链 1.0.9 升级与主槽逐字节回读、V3 历史回读和硬件精确保留3000条；P3已取得擦除流程、部分写入、END后和暂停搬运流程的真实电池断电恢复证据，但不证明 NOR/NVMC 忙脉冲中断电。保留策略冷启动持久性已验证；realme到小米数据库迁移已完成；持续App3000策略retain验收通过，最新Live回归已通过；生产信任链部署待完成。
+生产密钥已在仓库外创建；首次建立生产固件信任需通过 SWD 烧录含对应公钥的 MCUboot，
+现有设备的 OTA 仍要求其当前 MCUboot 所信任的旧密钥。生产切换与数据保留需要分别验证。
 
 > 严格区分「编译通过」与「真机验证通过」。**没有真机验证的一律不算通过。**
 
@@ -62,14 +80,14 @@
 
 | 项 | 说明 |
 |---|---|
-| 电压读数是否等于**电池**电压 | 当前读数 3325~3336 mV、极差仅 11 mV、OTA 重载下也不跌 → 几乎肯定是**调试器供电的稳压 3.3 V**。判定需拔掉调试器供电、让板子跑电池但保留 SWD |
+| 电压读数是否等于**电池**电压 | 9月读数来自疑似调试器供电；10月用户已确认电池供电，手机读数2.989→2.930 V。万用表绝对精度及电池端压对应关系尚未验证 |
 | **手机端** OTA 客户端在固件 `1.0.8+0` 上的真机跑测 | 本批回归用的是**PC 侧** `tools/ota_host_client.py`；App（`f86f670`）的手机端 OTA 流程上一次真机联调是在该提交之前的代码上做的 |
 
 ### 2.4 已部分实现
 
 | 项 | 现状 |
 |---|---|
-| 历史记录含电压字段 | 固件**未实现**（始终 12 B，无电压）；Android 侧 `HistoryRecordFormat.V3`(14 B) 与 `ThermometerV3Profile` 是**预留能力**，当前不被任何固件选中，且明确禁止用版本号/包长推断 |
+| 历史记录含电压字段 | v9 已实现 12 B packed 存储 / 14 B 显式协商回传，能力位 0x40；旧数据与旧 App 12 B 请求保留兼容。构建/native C 测试通过，尚未真机升级回读 |
 | `mcuboot_serial`（串口救砖） | 配置存在但**未启用**；`dfu_application.zip` 已生成但用不上 |
 | LTR-390UV / SHT40 驱动 | 代码在 `src/sensors/`，**主流程未调用** |
 
@@ -78,13 +96,13 @@
 | 项 | 说明 |
 |---|---|
 | App OTA 客户端与服务端**双向确认**的自动化回归 | 目前靠人工跑 `tools/ota_host_client.py` 与手机操作 |
-| 生产签名密钥 | 当前只有开发密钥，**没有**生产密钥；切换需重烧含新公钥的 MCUboot |
+| 生产签名与信任部署 | 仓库外生产密钥与 Android keystore 已建立，生产 APK 已验签；设备生产公钥信任尚未通过 SWD 部署。现有设备 OTA 必须继续使用其原信任密钥 |
 | 断电专项（OTA 中途断电）的完整矩阵 | 有 `tools/ota_powerloss_reset.py`，但覆盖的场景未穷举 |
-| mcumgr 尺寸评估 | 结论倾向"nRF52810 装不下"（RAM 侧需 +2–4 KiB，而当前只剩 1,624 B），尚未正式出结论 |
+| mcumgr 尺寸评估 | 结论倾向"nRF52810 装不下"（RAM 侧需 +2–4 KiB，而当前只剩 1,496 B），尚未正式出结论 |
 
 ### 2.6 已知 bug
 
-**当前没有已确认的、可复现的功能性 bug。**
+2026-10-09 历史同步、去重和断线重试专项未发现残留可复现问题；本次修复及验证边界见文末和 android/HANDOFF.md。
 
 历史修复记录（避免重复踩坑）：
 
@@ -97,10 +115,10 @@
 
 | 级别 | 风险 |
 |---|---|
-| High | **RAM 余量仅 1,624 B（93.39%）**。任何新功能（含继续用 mcumgr、加日志缓冲、加大包缓存）都极易把它打穿 |
+| High | **RAM 余量仅 1,496 B（93.91%）**。任何新功能（含继续用 mcumgr、加日志缓冲、加大包缓存）都极易把它打穿 |
 | High | **MCUboot 只剩 892 B**。任何往 MCUboot 加功能（serial recovery、加密、shell）都会溢出 |
 | High | **overwrite-only 无回滚**：升级过程中断电无法回退到旧固件（设计取舍，见 `OTA.md` §2.1） |
-| Medium | 签名镜像相对 app 子区只剩 13,137 B（仅作偏保守参考；正式门禁以 primary slot 与 6 KiB 预留计算）。继续加 ROM 很快触红线 |
+| Medium | 开发签名镜像距 primary 减 6 KiB 预留红线仅余 5,493 B（正式门禁以当前产物计算）。继续加 ROM 很快触红线 |
 | Medium | `OTA_AUTH_KEY` 是**弱凭据**（公开可得），只防误触/DoS；若被恶意反复 START 会反复擦次级槽。真正的防线是 ECDSA 验签 |
 | Low | 恢复出厂/换板时若只重烧 App、不清外置 Flash，历史写头可能与存量数据不一致 |
 | Low | WinRT BLE 栈成功率约 1/6，联调脚本必须整体重试 |
@@ -126,11 +144,11 @@
 | Firmware commit 时间 | 2026-09-14 |
 | Firmware 远端同步 | ✅ 已推送到 `origin/main` |
 | Android branch | `main` |
-| Android commit | **`f86f670`** = 上次真机联调的 App 功能基线；当前 HEAD 用 `git log -1` 查 |
+| Android commit | **`be12069`** = 2026-10-09 历史同步/重连验证，旧 OTA 基线仍为 f86f670 |
 | Android 远端同步 | ✅ 已推送到 `origin/main` |
-| 两侧互相兼容的 commit | 固件 `b97088d` ↔ App `f86f670` 为真机功能基线。2026-09-15 清理仅修正 GATT Status 声明与死别名，UUID、报文及 OTA 命令布局不变；新 HEAD 的真机回归待做 |
-| 当前 firmware version | **`1.0.8+0`**（`VERSION` 文件：MAJOR 1 / MINOR 0 / PATCHLEVEL 8 / TWEAK 0） |
-| 当前 Android App version | `versionCode = 1`、`versionName = "1.0"`（**与固件版本无对应关系**） |
+| 两侧互相兼容的 commit | 旧完整功能基线固件 b97088d ↔ App f86f670；10月历史/重连专项为设备 patch=8 ↔ App be12069，未读取设备固件hash，未验证手机OTA |
+| 当前 firmware 源码 version | **`1.0.9+0`**（`VERSION`：MAJOR1 / MINOR0 / PATCHLEVEL9 / TWEAK0）；设备已升级到开发信任链1.0.9，主槽匹配候选；不是仅凭源码HEAD或版本号推断 |
+| 当前 Android App version | `versionCode = 4`、`versionName = "1.1.2"`（**与固件版本无对应关系**） |
 | 当前 BLE protocol version | **当前没有独立的 BLE protocol version** —— 靠状态帧 `byte5` 能力位与帧长做隐式能力判断，见 `PROTOCOL.md` §6 |
 | 当前 OTA protocol version | **当前没有独立的 OTA protocol version**。OTA 服务首次出现在固件 `1.0.6+0`，此后字段布局未变（`1.0.8+0` 仍兼容），但**没有**任何版本字段可供协商 |
 | MCUboot / image format 兼容状态 | 镜像格式 = MCUboot `ih_hdr_size=512` + TLV；签名 **ECDSA-P256**；升级模式 **overwrite-only**；`CONFIG_BOOT_MAX_IMG_SECTORS=128`。次级槽与主槽均为 `0x28000`。**更换签名私钥必须重烧 MCUboot** |
@@ -157,7 +175,7 @@
 | 步骤 | 结果 |
 |---|---|
 | 构建 | `tools/build_sysbuild.py --signing-key <pem> build-verify2` → **EXIT=0**；`zephyr.bin` 与 `build-v8` **逐字节一致**（sha256 `719b77b6…`） |
-| size/release gate | `size_summary` **PASS（0 FAIL / 2 WARN：E MCUboot 892 B、G RAM 93.39%）**；`release_gate` **PASS（0 FAIL / 0 WARN）** |
+| size/release gate | `size_summary` **PASS（0 FAIL / 2 WARN：E MCUboot 892 B、G RAM 93.91%）**；`release_gate` **PASS（0 FAIL / 0 WARN）** |
 | `imgtool verify` | 正向 `Image was correctly validated`（1.0.8+0）；负向用无关密钥 → `No signature found for the given key` |
 | 真机 OTA 轮 1 | 推 `build-stk8`（149,560 B）→ 主槽 `ih_img_size` **149,528 → 149,560** ✅ |
 | 真机 OTA 轮 2 | 推 `build-verify2`（149,528 B）→ 主槽 **149,560 → 149,528** ✅，设备恢复发布镜像 |
@@ -173,26 +191,23 @@
 
 ### P1 — 验证「VDD 是否等于电池电压」
 
-- **要实现什么**：拔掉调试器供电，让板子由电池供电、保留 SWD，读 VDD。
-- **为什么**：当前读数几乎肯定是调试器的稳压 3.3 V。若 VDD ≠ 电池电压，该功能的产品价值为 0（甚至误导用户）。
+- **要实现什么**：在已确认的电池供电状态下，对照万用表电池端压与VDD/App，验证绝对精度及负载压降。
+- **当前进展**：用户已确认电池供电，读数2.989→2.930 V；需万用表对照，不能沿用9月调试器供电推断。
 - **涉及文件**：`src/vdd.c`、`app.overlay` 的 `&adc`；测量用 pyOCD（`-M attach`，不发 reset，直接读 RAM 里的 `g_vdd_mv`，注意连接会 halt）
 - **已有基础**：`vdd_sample_mv()` / `vdd_cached_mv()` / `g_vdd_min_mv` / `g_vdd_max_mv`（诊断用区间统计，见 `src/vdd.h`）
 - **不能破坏**：实时帧长度 8、offset 6 的语义、`0xFFFF` 哨兵、量程 1700~3600 mV
 - **如何验证**：电池从满电到欠压扫一遍，读值应随电池电压单调变化（而不是恒定 3.3 V）
 - **完成条件**：给出"VDD 是否等于电池电压"的明确结论；若不等于，要么改测法，要么在文档/App 中明确标注该读数含义
 
-### P2 — Android 端把「历史含电压」做成**能力位驱动**
+### P2 — 历史含电压与持续保留 3000 条（升级/回读通过，冷启动持久性通过，最新Live回归通过）
 
-- **要实现什么**：固件在状态帧能力字节新增一位（例如 `CAP_HISTORY_VOLTAGE 0x40`），历史记录扩展为 14 B；App 仅在**该能力位置位**时切换到 `HistoryRecordFormat.V3`。
-- **为什么**：`ThermometerV3Profile` 已经是预留实现，但当前**没有任何能力位可依据**，只能用 V2。补齐后历史数据也能带电压。
-- **涉及文件（固件）**：`src/main.c`（`STATUS_CHAR_LEN` / 能力位 / `status_char_build`）、`src/storage/w25q64.h`（`W25Q64_RECORD_SIZE`）、`src/main.c` 的记录构建与历史回读解析
-- **涉及文件（App）**：`DeviceProfileFactory.kt`、`ThermometerV3Profile.kt`、`HistoryDataParser.kt`、`HistoryRecordFormat`
-- **已有基础**：App 侧 `V3` 解析器已写好并有单测；固件侧记录构建集中在 `history_push_record()`
-- **不能破坏**：⚠️ **这是跨版本不兼容改动**。固件一旦改记录大小，旧 App 会解析错位。
-  必须：① 抬固件版本；② 只在能力位置位时 App 才换格式；③ **不得**用版本号或包长推断。
-  另注意 `W25Q64_RECORDS_PER_PAGE`（21 条/页）会随记录大小变化，历史区容量口径要重算。
-- **如何验证**：单元测试覆盖「能力位为 0 → V2 / 为 1 → V3」；真机同步历史后逐条核对时间戳与数值
-- **完成条件**：新旧固件 × 新旧 App 的四种组合都能正确解析（旧 App 遇到新固件时应**安全降级**而不是错位）
+- Flash 不扩展 record size：仍 12 B、21 条/页、336 条/扇区；新电压编码见 PROTOCOL §3.3。
+- 0x40 能力位与尾字节 03 的 5 B HISTORY 请求明确协商 14 B；4 B 请求仍为 12 B。
+- 0x80 能力位与 `[3000 LE32, 04]` 在 HISTORY 特征启用持续保留；不得回退到 CLEAR 特征。
+- 新 NVS key 7 保存原子窗口检查点，成功提交/回读后才回收；部分首扇区的旧前缀仅做 1→0 零化。
+- native C fixture 编译真实生产 writer/retention/恢复与 wire 代码，0 failures；两端构建与资源门禁通过。
+- 原始记录已本机完整留档；硬件保留及独立raw3000条集合验收通过；手机迁移与精简已应用，持续策略retain验收通过；冷启动持续窗口及raw集合已验证，最新Live回归通过。
+- 新旧 App × 固件必须验证显式协商；禁止按版本号或包长猜格式，旧记录电压为未知而非当前电压补值。
 
 ### P3 — 断电专项矩阵
 
@@ -242,7 +257,7 @@
 
 ```
 NRF52xxx-FieldTemp/
-├── VERSION                     # 镜像版本号唯一来源（1.0.8+0）
+├── VERSION                     # 镜像版本号唯一来源（1.0.9+0）
 ├── prj.conf                    # App Kconfig（每个符号只出现一次）
 ├── app.overlay                 # ⭐ 板级引脚 + W25Q64 + SAADC（唯一实际生效的 overlay）
 ├── pm_static.yml               # ⭐ Partition Manager 静态布局（唯一编辑入口）
@@ -303,9 +318,9 @@ App 工程根目录 = 仓库根的 `source/`（Gradle 工程在 `source/`，不�
 | `data/device/parser/HistoryDataParser.kt` | `HistoryDataParser` / `HistoryRecordFormat` | 历史记录解析，支持 V1(8)/V2(12)/V3(14) 三种布局 |
 | `data/device/parser/MaxMinTempParser.kt` | `MaxMinTempParser` | 温度极值帧解析（4 B 旧 / 12 B 新） |
 | `data/device/parser/DataParser.kt` | `DataParser<T>` | 解析器接口（`expectedMinLength` / `canParse` / `parse`） |
-| `data/device/profile/DeviceProfileFactory.kt` | `DeviceProfileFactory` | ⭐ **Profile 选择**：只按"是否有实时数据服务/有效版本号"选 V1 或 V2，**禁止按版本号推断历史长度** |
+| `data/device/profile/DeviceProfileFactory.kt` | `DeviceProfileFactory` | ⭐ **Profile 选择**：先按 0x40 显式能力选 V3，否则按实时服务/有效版本选 V1/V2；**禁止按版本号推断历史长度** |
 | `data/device/profile/thermometer/ThermometerV2Profile.kt` | `ThermometerV2Profile` | 当前**唯一生效**的 Profile（12 B 历史） |
-| `data/device/profile/thermometer/ThermometerV3Profile.kt` | `ThermometerV3Profile` | 预留能力（14 B 历史），**当前不被选中** |
+| `data/device/profile/thermometer/ThermometerV3Profile.kt` | `ThermometerV3Profile` | 状态 `0x40` 能力位选中；发送 timestamp LE32 + `03` 的 5 B 请求，按 14 B 历史解析 |
 | `data/device/model/RealtimeData.kt` | `ThermometerData` | 实时数据模型（含 `batteryVoltage` / `batteryVoltageReported`） |
 | `data/device/model/BatteryVoltageDisplay.kt` | `BatteryVoltageDisplay` | 电压显示工具（无效值显示 `--`） |
 | `data/model/DeviceStatus.kt` | `DeviceStatus` | 状态模型（含 `capabilityFlags` / `isWallClockTrusted` / `retentionDays`） |
@@ -359,9 +374,9 @@ App 工程根目录 = 仓库根的 `source/`（Gradle 工程在 `source/`，不�
 | **MCUboot 当前大小** | **31,876 B（97.28%）**，剩余 **892 B** |
 | MCUboot RAM | **10,432 B / 24,576 B = 42.45%** |
 | App 分区（app slot） | 163,328 B（`0x27E00`） |
-| **App 当前 Flash 占用** | **149,528 B / 163,328 B = 91.55%**，剩余 **13,800 B** |
-| **App 当前 RAM 占用** | **22,952 B / 24,576 B = 93.39%**，剩余 **1,624 B** |
-| **本次 signed image 大小** | **150,191 B**（ECDSA DER 长度可能逐次变化）；红线 157,696 B（= 主槽 163,840 − 6 KiB 预留），本次余 **7,505 B** |
+| **App 当前 Flash 占用** | **151,540 B / 163,328 B = 92.78%**，剩余 **11,788 B** |
+| **App 当前 RAM 占用** | **23,080 B / 24,576 B = 93.91%**，剩余 **1,496 B** |
+| **本次 signed image 大小** | **152,203 B**（ECDSA DER 长度可能逐次变化）；红线 157,696 B（= 主槽 163,840 − 6 KiB 预留），本次余 **5,493 B** |
 | BLE buffer 调优 | `BT_BUF_ACL_RX/TX_SIZE = 132`（= MTU 128 + 4）、`L2CAP_TX_MTU = 128`、`ACL_TX_COUNT = 4`、`L2CAP_TX_BUF_COUNT = 4`、`BT_BUF_CMD_TX_SIZE = 65`、`GATT_CACHING=n`、`ATT_PREPARE_COUNT=0` |
 | stack size 调整 | main 1024、system workqueue 1280、BT RX 1024、MPSL work 640、ISR 1024、idle 128 |
 | logging 当前状态 | **全关**：`CONFIG_LOG=n` |
@@ -479,15 +494,15 @@ App 工程根目录 = 仓库根的 `source/`（Gradle 工程在 `source/`，不�
 **无。** 当前固件与 App 均可构建、可烧录、可 OTA，核心链路真机验证通过。
 
 ### High
-1. **RAM 余量仅 1,624 B（93.39%）** —— 下一次功能扩展大概率超限。
+1. **RAM 余量仅 1,496 B（93.91%）** —— 下一次功能扩展大概率超限。
 2. **MCUboot 仅剩 892 B** —— 任何往 MCUboot 加东西的尝试都会失败。
 3. **VDD ≠ 电池电压 待验证** —— 若结论是"不等于"，则该功能对用户是误导，需重新设计。
 
 ### Medium
-4. **手机端** OTA 客户端尚未在固件 `1.0.8+0` 上做真机回归（PC 侧 `ota_host_client.py` 已完成两轮）。
-5. overwrite-only 无回滚能力，断电场景未做完整矩阵。
-6. 历史记录不含电压（`HistoryRecordFormat.V3` 预留但无能力位可用）。
-7. 生产签名密钥不存在，上线前必须生成并重烧 MCUboot。
+4. SWD信号线连接时曾出现W25Q64 init_res=22，根因未定；隔离SWD重试通过，仍须关注冷启动。
+5. overwrite-only 无回滚能力；四阶段已有真实去电恢复证据，但忙脉冲中断电及更多重复场景未验证。
+6. v9 已实现 `0x40` + 显式请求的 V3 含电压历史；旧存量电压未知（`0xFFFF`），不得用当前实时电压回填。真机验收结论见最新阶段记录。
+7. 生产密钥已外置建立，设备尚未切换对应公钥；首次生产信任需 SWD 部署 MCUboot，旧设备 OTA 仍用旧信任密钥。
 8. 存量设备若只重烧 App、不清外置 Flash，历史写头可能不一致。
 
 ### Low
@@ -507,3 +522,59 @@ App 工程根目录 = 仓库根的 `source/`（Gradle 工程在 `source/`，不�
 5. 动 OTA 之前读 `OTA.md`，改协议之前读 `PROTOCOL.md`。
 6. **改动落地顺序固定为：构建 → `size_summary.py` + `release_gate.py` → 真机回归 → 提交 → push。**
    没上过板的改动不要先提交成新基线。
+
+## 2026-10-09 Android 同步修复与统一项目
+
+Android 已合并到本仓库 android/，直接作为 Gradle 根目录。同步来源 commit `be12069abae643085b3ed9773ce1591d462d1e2d`（独立 Android 仓库）；修复源码已在手机验证，固件本轮没有改动或重新烧录。设备状态 patch=8，不能凭版本号证明其二进制等于当前固件 HEAD。
+
+已验证：105 项单元测试，6 项手机 Room 隔离数据库测试、1 项冷启动测试和1项显式真实 BLE 回归；连续两次全量、立即重试、传输中断连重连及增量同步均通过。00:43 有效记录 33,476（模块33,382/GPS94），重复/未来时间为0，原22,484条异常记录仍在用户授权的本机归档。手机数据库/恢复脚本不上传。
+
+旧 APK 的 patch>=3→14B 错判造成2043/2044年；该轮设备 v8 为12B，当前源码 v9 的14B必须显式协商。OTA仍 zephyr.signed.bin。修复包含无进展超时、事务提交后清缓冲、按设备/时间戳去重、会话清理互斥/断连取消、GPS进度排除及通知确认超时。冷启动会话必须在init监听前初始化。详见 [Android HANDOFF](android/HANDOFF.md)。
+
+用户已确认电池供电，读数约2.989→2.930 V，下降59 mV；绝对精度、容量/续航和VDD到电池端压对应关系仍需万用表验证。该轮连接修复未重建固件；P2阶段构建、当前资源与生产签名状态以 §2 最新阶段记录为准，开发信任链升级、部分P3边界及硬件保留已验收；冷启动持久性已验收，迁移、精简及持续策略retain已验收，最新Live回归通过。
+
+统一项目目录验证：在 android/ 未复制任何本机凭据的情况下，JDK17 + ANDROID_HOME 构建 testDebugUnitTest / assembleDebug 成功（1m20s），105项单测0失败。调试构建OTA默认授权值为空，需开发者按example在本机配置；本轮未重建或烧录固件。
+
+
+### 2026-10-09 OTA / P2 历史实证（当前状态见下节）
+
+手机使用正式 Android OTA 代码上传开发信任链的 1.0.9 `zephyr.signed.bin`（152,203 B）。升级前设备 App 和 MCUboot 字节匹配 `build-v8`；内部 Flash、UICR、外部 secondary/NVS/history 与完整手机数据库均已本机归档，不入 Git。
+
+| P3 场景 | 已取得的证据与结果 | 边界 |
+|---|---|---|
+| END 后、TRIGGER 前 | 初次电池断电后主槽163,840 B不变。隔离整根SWD后重复断电，BLE及同镜像续传VERIFY通过（25.588 s） | 初次SWD仍连接的后续启动曾出现W25Q64 init_res=22；原因未定，保留风险 |
+| 部分写入 | confirmed=32,768/152,203 B、未END/TRIGGER时真实电池断电；续传VERIFY通过（37.018 s） | 证明部分上传期间断电恢复，不证明SPI写忙脉冲被切断 |
+| 擦除流程 | 第二次断电后secondary前143,360 B已擦除、镜像尾部8,192 B仍保留；重新上传VERIFY通过（48.926 s） | 证明擦除流程中断，不证明NOR WIP脉冲中断 |
+| MCUboot搬运 | copy3快照前1,024 B匹配候选、完整镜像未完成；CPU暂停后用户拔整根SWD和电池5 s；重启主槽候选152,203 B逐字节匹配，MCUboot32 KiB不变，1.0.9、VTOR=0x8200、CFSR/HFSR=0 | 调试器暂停的搬运流程遭遇真实去电，不等于NVMC写脉冲中断 |
+
+升级后完整历史同步299.778 s通过，实际接收33,288条；已有传感器核心/GPS保护、无重复和无未来时间检查通过。能力字节255（0xFF）；9条历史电压为2.851–2.876 V，实时VM读数2.871 V（VM状态，不作为fresh raw证明）。旧存量电压未知，不用当前电压回填。
+
+硬件保留测试90.353 s通过：维护busy清除、设备count=3000、全量回读3000。独立BLE raw捕获38.416 s通过：3000条V3、42,000 B、真实END、前后8 B HISTORY_INFO一致。手机数据库副本已按这些raw记录精确验证3000条，保留GPS180条及quarantine22,484条；**当时副本尚未应用；迁移/精简后续进展见当前验收状态，手机仍安装Debug APK**。
+
+旧1.0.8测试序列中硬件尾部14条被擦除/覆盖；这些记录的timestamp及传感器数值14/14存在于本机完整App归档。原档NVS写头99:14、擦除后快照99:3，oldest均0；事故瞬间检查点未知，不能断言为0。旧scan在检查点落后、恢复被触发时漏掉next_sector的部分数据，与该损失一致。实际C回归覆盖stale99:0+14及stale99:14+28：旧函数回退99:0，新函数分别恢复99:14/99:28、追加后全部原行保留且零擦除。新策略冷启动持久性现已通过隔离SWD后的真实电池断电、全量回读及独立raw验证。
+
+生产ECDSA及Android签名资产在仓库外，生产APK验签通过；**生产MCUboot公钥信任尚未部署、生产APK尚未安装**。当前OTA沿用设备原公钥对应的开发信任链。候选产物入口为 [v1.0.9-rc.1](https://github.com/linckr/NRF52xxx-FieldTemp/releases/tag/v1.0.9-rc.1)，发布状态以页面为准；两个upstream PR #2在本轮记录时OPEN、未合并，后续须实时查询。迁移与精简已应用，持续策略retain真机通过；最新1.1.2 Live回归171.105 s通过，最终归档模块3000/受保护手机样本218。
+
+### 2026-10-10 当前验收状态：App 1.1.2 / 持续3000条
+
+当前App为versionCode4 / versionName1.1.2、Room11，手机安装Debug APK；Firmware为开发信任链1.0.9。124项JVM单元测试、10项isolated Room测试通过；生产1.1.2 APK v2/RSA3072验签通过、证书未变，尚未安装生产APK。最新Live连续全量/立即重试/中途断连/重连回归171.105 s通过；最终归档结果见本节末。
+
+手机已完成realme完整数据库到小米迁移（主库SHA匹配源归档），原小米1,042条GPS已备份、未并入。随后按完整归档及硬件raw集合应用精简；早先一次精简后App增至3004而硬件仍3000，确认一次性精简不足，现已实现持续策略。最新明确retain真机36.388 s通过：硬件3000、App模块3000、手机来源样本208；启用标记已持久化。手机样本包含有/无GPS，模块3000不等于整个数据库总行数；隔离记录及私人完整档案仍保留本机，不上传。
+
+持续策略按device显式启用：仅在retain3000命令得到count=3000且idle确认后保存本地prefs。对已启用且支持0x80的设备，每次历史同步发timestamp=0全量请求；只有本会话真实END、received=3000、唯一wire timestamps=3000、前后原始8 B HISTORY_INFO完全一致、所有upsert成功及连接/会话仍属于捕获目标时，才事务删除不在该实际wire集合的模块行。删除ID每批最多500，失败/取消/切换设备全部回滚、不删除；窗口不稳定最多自动重试一次。不能按时间排序取3000，缓存行可能比设备窗口更新。启用标记仅代表策略启用，不能代替每次精简成功证据。
+
+Room11的isPhoneSample采用INTEGER NOT NULL DEFAULT0；新手机实时行始终true，即使没有GPS。10→11无损迁移把已有GPS行标为phone，旧无GPS来源未知保守默认false；在完整归档后按真实wire集合核对，不能靠年份猜测删除。历史DAO/count/增量仅处理false且geoNull；所有phone/GPS、隔离表和其他设备受保护。严格核心数值断言曾阻止单行旧手机实时/硬件差异的错误精简，没有通过放宽断言绕过。测试覆盖来源保护、精确164缓存差集、1201条跨删除批次、SQL中段abort和session失效原子回滚。
+
+硬件3000策略已在隔离整根SWD后的实际电池断电冷启动验证：archive_sync23.296 s、完整3000及核心/GPS/无重复/未来检查通过；再次raw19.434 s通过（3000 V3、42000 B、END、8 B INFO稳定）。此前小米1.1.0 archive_sync79.289 s通过是历史证据；当前1.1.2也已独立完成Live回归，见本节末。VDD2.765 V为10/9约18:45观测、2.875 V为10/10约00:17 VM观测，均非当前实时读数，ADC仍未校准/无万用表对照。
+
+P3四阶段已取得擦除流程、部分写入、END后及暂停MCUboot搬运的真实电池断电恢复证据；不证明NOR WIP/NVMC写脉冲被切断。SWD仍连接时曾出现W25Q64 init_res=22，根因未定，隔离SWD重试通过不等于已定位。旧v8硬件尾部14条曾被覆盖，timestamp/传感器数值14/14均在本机完整App档案保全；新恢复函数已有真实C回归与冷启动证据。
+
+固件资源保持App Flash151540 B、RAM23080 B（余1496 B），MCUboot31876 B（余892 B），分区不变。DEV signed候选152203 B已真机回读；生产asset152202 B未部署，DER长度可变。两镜像App payload151540 B逐字节一致，SHA256 `236323e4319f7228ce6b4856bb1736a4bede1cf58e3dfc85239678bdc943494c`；完整signed文件不能混同。生产imgtool验证通过，但生产MCUboot公钥信任尚未部署、候选产物入口为 [v1.0.9-rc.1](https://github.com/linckr/NRF52xxx-FieldTemp/releases/tag/v1.0.9-rc.1)，发布状态以页面为准；两个upstream PR #2在最近记录时OPEN，后续实时核对。
+
+持续策略与Live验收已完成，最终归档模块3000；生产信任部署与ADC校准仍是独立待办。
+
+### 最终Live与一致归档验收
+
+最终真机Live回归171.105 s通过：两次连续全量各3000、立即重试、收到部分记录后断连且全部既有模块ID未删除、重连及再次同步完成3000；仍保留窗口内记录ID/核心字段和所有既有手机样本，无重复/未来时间。重连首轮观察到0条历史、随后一次自动全量重试成功；本轮已由有界重试覆盖，但首次重连延迟为Medium性能边界，根因未定位。
+
+最终只读一致归档（2026-10-10约01:12）SQLite integrity ok：模块3000、GPS187、无GPS手机样本31（受保护手机样本共218）、active3218、quarantine22484，未来时间0、模块重复0。Live期间VM电压开始2.886 V、结束2.868 V（本轮观测，不是ADC校准证明）。App已恢复运行；手机临时USB亮屏设置已恢复原值。私人数据库、档案路径、标识与归档内容不进Git。

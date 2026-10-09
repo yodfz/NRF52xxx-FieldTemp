@@ -44,6 +44,7 @@
 #include "sensors/spl06.h"
 #include "storage/w25q64.h"
 #include "storage/nvs_config.h"
+#include "storage/history_codec.h"
 #include "ble/ble_adv.h"
 #include "ble/ble_services.h"
 #include "ble/ble_ota.h"
@@ -162,6 +163,7 @@ static uint32_t history_skipped_filtered = 0;     // 时间戳过滤跳过的记
 // 历史数据通知发送控制（使用 bt_gatt_notify_cb 做“发完再发”流控）
 static struct bt_gatt_notify_params history_notify_params;
 static bool history_sending = false;                      // 是否有在途的历史通知
+static uint8_t history_wire_size = 12U;
 static uint8_t history_tx_buf[60];                        // 历史数据发送缓冲区（需保持到回调结束）
 
 // W25Q64存储管理变量（提前声明，供history_char_ccc_cfg_changed使用）
@@ -170,7 +172,7 @@ static uint16_t oldest_sector = 0;    // 最旧扇区
 static uint16_t next_record_in_sector = 0;  // 当前扇区内的记录索引
 
 // 统一的历史总记录数计算函数（基于存储位置推算可读记录数）
-static uint32_t storage_get_total_records(void)
+static uint32_t storage_physical_count(void)
 {
 	// 无论是否环形覆盖，总是从 oldest_sector 开始写到 next_sector:next_record_in_sector
 	if (next_sector == oldest_sector) {
@@ -188,6 +190,214 @@ static uint32_t storage_get_total_records(void)
 
 	// 有效记录数 = 完整扇区数 * 每扇区容量 + 写入扇区内的记录数
 	return (uint32_t)sector_count * W25Q64_RECORDS_PER_SECTOR + next_record_in_sector;
+}
+
+/* A separate atomic NVS checkpoint protects the logical window before reclamation. */
+static history_retention_t retention;
+static struct k_work_delayable retention_work;
+static bool retention_busy;
+static uint8_t retention_phase;
+static uint16_t retention_prefix;
+static uint32_t retention_scan_cursor;
+static uint32_t retention_scan_remaining;
+#define HISTORY_SLOT_COUNT (W25Q64_MAX_SECTORS_LIMIT * W25Q64_RECORDS_PER_SECTOR)
+BUILD_ASSERT(sizeof(struct data_record) == W25Q64_RECORD_SIZE);
+BUILD_ASSERT(sizeof(history_tx_buf) >= 4U * 14U);
+
+static uint32_t storage_get_total_records(void)
+{
+    return retention.limit ? retention.count : storage_physical_count();
+}
+static uint16_t storage_first_record(void)
+{
+    return retention.limit ? retention.first_record : 0U;
+}
+static uint32_t storage_record_address(uint32_t slot)
+{
+    uint32_t sector = slot / W25Q64_RECORDS_PER_SECTOR;
+    uint32_t record = slot % W25Q64_RECORDS_PER_SECTOR;
+    return W25Q64_STORAGE_BASE + sector * W25Q64_SECTOR_SIZE +
+        (record / W25Q64_RECORDS_PER_PAGE) * W25Q64_PAGE_SIZE +
+        (record % W25Q64_RECORDS_PER_PAGE) * W25Q64_RECORD_SIZE;
+}
+static uint32_t storage_head_slot(void)
+{
+    return ((uint32_t)next_sector * W25Q64_RECORDS_PER_SECTOR +
+            next_record_in_sector) % HISTORY_SLOT_COUNT;
+}
+static bool storage_valid_record(const struct data_record *record)
+{
+    uint32_t pressure;
+    uint16_t voltage;
+    return record->timestamp > 0U && record->timestamp <= 4102444800U &&
+        record->temperature >= -5000 && record->temperature <= 15000 &&
+        record->humidity <= 10000U &&
+        history_decode_pressure(record->pressure_pa, &pressure, &voltage);
+}
+static int retention_checkpoint(void)
+{
+    retention.magic = HISTORY_RETENTION_MAGIC;
+    retention.head_sector = next_sector;
+    retention.head_record = next_record_in_sector;
+    return nvs_save_history_retention(&retention);
+}
+static void retention_scan_begin(void)
+{
+    retention_scan_cursor = storage_head_slot();
+    retention_scan_remaining = storage_physical_count();
+    retention.count = 0;
+    retention.first_sector = next_sector;
+    retention.first_record = next_record_in_sector;
+    if (retention.first_record == W25Q64_RECORDS_PER_SECTOR) {
+        retention.first_sector = (next_sector + 1U) % W25Q64_MAX_SECTORS_LIMIT;
+        retention.first_record = 0;
+    }
+}
+/* At most 32 SPI reads per work slice; startup may call repeatedly before BLE starts. */
+static int retention_scan_step(void)
+{
+    struct data_record record;
+    for (unsigned n = 0; n < 32U && retention_scan_remaining &&
+            retention.count < retention.limit; ++n) {
+        uint32_t cursor = (retention_scan_cursor + HISTORY_SLOT_COUNT - 1U)
+            % HISTORY_SLOT_COUNT;
+        int ret = w25q64_read(storage_record_address(cursor),
+                             (uint8_t *)&record, sizeof(record));
+        if (ret) return ret;
+        retention_scan_cursor = cursor;
+        retention_scan_remaining--;
+        if (storage_valid_record(&record)) {
+            retention.count++;
+            retention.first_sector = retention_scan_cursor / W25Q64_RECORDS_PER_SECTOR;
+            retention.first_record = retention_scan_cursor % W25Q64_RECORDS_PER_SECTOR;
+        }
+    }
+    return retention_scan_remaining && retention.count < retention.limit ? 1 : 0;
+}
+static const struct data_record erased_history_record; /* all-zero NOR tombstone */
+static void retention_work_handler(struct k_work *work)
+{
+    ARG_UNUSED(work);
+    int ret = 0;
+    k_mutex_lock(w25q64_get_mutex(), K_FOREVER);
+    if (retention_phase == 0U) {
+        retention.limit = 3000U;
+        retention.gc_sector = oldest_sector;
+        retention_scan_begin();
+        retention_phase = 1U;
+    }
+    if (retention_phase == 1U) {
+        ret = retention_scan_step();
+        if (ret == 1) { ret = 0; goto again; }
+        if (ret) goto again;
+        retention_phase = 2U;
+    }
+    if (retention_phase == 2U) {
+        /* No destructive operation is permitted before this verified atomic write. */
+        ret = retention_checkpoint();
+        if (ret) goto again;
+        oldest_sector = retention.first_sector;
+        retention_prefix = 0;
+        retention_scan_cursor = retention.gc_sector;
+        retention_phase = 3U;
+    }
+    if (retention_phase == 3U) {
+        if (retention_scan_cursor != retention.first_sector &&
+                retention_scan_cursor != HISTORY_GC_DONE) {
+            /* Only the old prefix is reclaimed; never erase the retained first/head sector. */
+            if (retention_scan_cursor == next_sector) { ret = -EINVAL; goto again; }
+            ret = w25q64_sector_erase(W25Q64_STORAGE_BASE +
+                    retention_scan_cursor * W25Q64_SECTOR_SIZE);
+            if (ret) goto again;
+            retention_scan_cursor = (retention_scan_cursor + 1U) % W25Q64_MAX_SECTORS_LIMIT;
+            goto again;
+        }
+        retention_phase = 4U;
+    }
+    if (retention_phase == 4U) {
+        /* Partial first-sector prefix: 1->0 programming, no erase of retained records. */
+        for (unsigned n = 0; n < 16U && retention_prefix < retention.first_record; ++n) {
+            uint32_t slot = (uint32_t)retention.first_sector * W25Q64_RECORDS_PER_SECTOR + retention_prefix;
+            ret = w25q64_page_program(storage_record_address(slot),
+                    (const uint8_t *)&erased_history_record, sizeof(erased_history_record));
+            if (ret) goto again;
+            retention_prefix++;
+        }
+        if (retention_prefix < retention.first_record) goto again;
+        retention.gc_sector = HISTORY_GC_DONE;
+        retention_phase = 5U;
+    }
+    if (retention_phase == 5U) {
+        ret = retention_checkpoint();
+        if (ret) goto again;
+        storage_position_t pos = {next_sector, oldest_sector, next_record_in_sector};
+        nvs_save_storage_position(&pos); /* compatibility checkpoint; key 7 remains authoritative */
+        retention_busy = false;
+        printk("[历史保留] 完成 count=%u limit=%u first=%u:%u\r\n",
+               retention.count, retention.limit, retention.first_sector, retention.first_record);
+        k_mutex_unlock(w25q64_get_mutex());
+        return;
+    }
+again:
+    k_mutex_unlock(w25q64_get_mutex());
+    if (ret < 0) printk("[历史保留] 重试: %d\r\n", ret);
+    k_work_schedule(&retention_work, ret < 0 ? K_SECONDS(1) : K_MSEC(1));
+}
+static int retention_request(uint32_t limit)
+{
+    if (limit != 3000U) return -EINVAL;
+    if (retention_busy || data_clear_in_progress || history_transfer_active ||
+            ble_ota_in_progress()) return -EBUSY;
+    /* The work runs on the same queue as sampling. There is no erase on the GATT thread. */
+    retention_busy = true;
+    retention_phase = 0U;
+    k_work_schedule(&retention_work, K_NO_WAIT);
+    return 0;
+}
+static void retention_after_write(void)
+{
+    if (!retention.limit || retention_busy) return;
+    uint32_t first = (uint32_t)retention.first_sector * W25Q64_RECORDS_PER_SECTOR + retention.first_record;
+    uint16_t previous_sector = retention.first_sector;
+    if (retention.count == 0U) {
+        first = (storage_head_slot() + HISTORY_SLOT_COUNT - 1U) % HISTORY_SLOT_COUNT;
+    }
+    retention.count++;
+    if (retention.count > retention.limit) {
+        uint32_t dropped = first;
+        struct data_record record;
+        for (unsigned n = 0; n < HISTORY_SLOT_COUNT; ++n) {
+            first = (first + 1U) % HISTORY_SLOT_COUNT;
+            int ret = w25q64_read(storage_record_address(first), (uint8_t *)&record, sizeof(record));
+            if (ret) { /* Recompute rather than destroy data after an I/O failure. */
+                retention_busy = true;
+                retention.gc_sector = oldest_sector;
+                retention_scan_begin();
+                retention_phase = 1U;
+                k_work_schedule(&retention_work, K_NO_WAIT);
+                return;
+            }
+            if (storage_valid_record(&record)) break;
+        }
+        retention.count--;
+        retention.first_sector = first / W25Q64_RECORDS_PER_SECTOR;
+        retention.first_record = first % W25Q64_RECORDS_PER_SECTOR;
+        if (retention.first_sector == previous_sector) {
+            /* Head recovery will see the new committed row; a tombstone cannot hide it. */
+            (void)w25q64_page_program(storage_record_address(dropped),
+                    (const uint8_t *)&erased_history_record, sizeof(erased_history_record));
+        }
+    } else {
+        retention.first_sector = first / W25Q64_RECORDS_PER_SECTOR;
+        retention.first_record = first % W25Q64_RECORDS_PER_SECTOR;
+    }
+    if (retention.first_sector != previous_sector || next_record_in_sector == 1U) {
+        retention_busy = true;
+        retention.gc_sector = previous_sector;
+        retention_phase = 2U;
+        k_work_schedule(&retention_work, K_NO_WAIT);
+    }
+    oldest_sector = retention.first_sector;
 }
 
 // 配置数据结构已移至 storage/nvs_config.h (device_config_t)
@@ -277,7 +487,8 @@ enum {
 /* 预计保留天数（名义速率，供 BLE 状态帧上报） */
 static uint16_t history_retention_days(void)
 {
-	uint32_t days = ((uint32_t)W25Q64_MAX_RECORDS * history_interval) / 86400U;
+	uint32_t capacity = retention.limit ? retention.limit : W25Q64_MAX_RECORDS;
+	uint32_t days = (capacity * history_interval) / 86400U;
 	return (days > 0xFFFFU) ? 0xFFFFU : (uint16_t)days;
 }
 
@@ -471,7 +682,7 @@ static void history_push_record(uint32_t ts, int16_t temperature,
 	/* OTA 期间暂停历史落盘：与 OTA 共用同一颗 W25Q64，且 SPI 争用会造成
 	 * OTA 写入的延迟抖动。这里只跳过本窗口的采样，不进重试缓冲 ——
 	 * 避免 OTA 结束后一次性补写，重新制造争用。 */
-	if (ble_ota_in_progress()) {
+	if (ble_ota_in_progress() || retention_busy) {
 		return;
 	}
 
@@ -488,7 +699,11 @@ static void history_push_record(uint32_t ts, int16_t temperature,
 	ram_buffer[ram_buffer_count].timestamp = ts;
 	ram_buffer[ram_buffer_count].temperature = temperature;
 	ram_buffer[ram_buffer_count].humidity = humidity;
-	ram_buffer[ram_buffer_count].pressure_pa = pressure_pa;
+	uint16_t mv = HISTORY_INVALID_MV;
+#ifdef CONFIG_ADC
+    mv = vdd_cached_mv();
+#endif
+    ram_buffer[ram_buffer_count].pressure_pa = history_pack_pressure(pressure_pa, mv);
 	ram_buffer_count++;
 	record_count++;
 
@@ -883,6 +1098,8 @@ static ssize_t interval_char_write_cb(struct bt_conn *conn,
 #define CAP_EVENT_RECORDS     0x04U  /* 支持突变/越限事件记录 */
 #define CAP_AVERAGE_RECORDS   0x08U  /* 历史记录为周期均值 */
 #define CAP_WALLCLOCK_ALIGN   0x10U  /* 周期记录时间戳按墙钟边界对齐（60→:00；300→:00/:05/…）*/
+#define CAP_HISTORY_VOLTAGE   0x40U
+#define CAP_HISTORY_RETENTION 0x80U
 #define CAP_PARTIAL_WINDOW    0x20U  /* 对时后首个窗口可能短于一个周期（保留部分窗口而非丢弃）*/
 
 static uint8_t status_char_data[STATUS_CHAR_LEN];
@@ -899,14 +1116,15 @@ static void status_char_build(void)
 	sys_put_le16((uint16_t)MIN(stored, (uint32_t)0xFFFF), &status_char_data[2]);
 	status_char_data[4] = (bt_connected ? 0x01 : 0x00) |
 			      (time_synced ? 0x02 : 0x00) |
-			      (data_clear_in_progress ? 0x04 : 0x00) |
+			      ((data_clear_in_progress || retention_busy) ? 0x04 : 0x00) |
 			      /* bit3：墙钟可信（本次上电收到过手机对时）。
 			       * 仅从 NVS 恢复旧时间时为 0 —— 此时周期记录不按整分网格结算，
 			       * App 不应假定时间戳落在 :00。 */
 			      (wallclock_ready() ? 0x08 : 0x00);
 	status_char_data[5] = CAP_HISTORY_INTERVAL | CAP_SAMPLE_FIXED |
 			      CAP_EVENT_RECORDS | CAP_AVERAGE_RECORDS |
-			      CAP_WALLCLOCK_ALIGN | CAP_PARTIAL_WINDOW;
+			      CAP_WALLCLOCK_ALIGN | CAP_PARTIAL_WINDOW |
+                          CAP_HISTORY_VOLTAGE | CAP_HISTORY_RETENTION;
 	sys_put_le16(firmware_version, &status_char_data[6]);
 	sys_put_le16(SAMPLE_INTERVAL_FIXED, &status_char_data[8]);
 	sys_put_le16(history_retention_days(), &status_char_data[10]);
@@ -937,33 +1155,24 @@ static void status_char_ccc_cfg_changed(const struct bt_gatt_attr *attr, uint16_
 
 // 历史数据特性写入回调（用于接收起始时间戳）
 static ssize_t history_char_write_cb(struct bt_conn *conn,
-				      const struct bt_gatt_attr *attr,
-				      const void *buf, uint16_t len, uint16_t offset,
-				      uint8_t flags)
+        const struct bt_gatt_attr *attr, const void *buf, uint16_t len,
+        uint16_t offset, uint8_t flags)
 {
-	// 检查数据长度（必须是4字节，表示Unix时间戳）
-	if (len != 4) {
-		printk("[历史数据] 错误: 数据长度不正确 (%d 字节，需要 4 字节)\r\n", len);
-		return BT_GATT_ERR(BT_ATT_ERR_INVALID_ATTRIBUTE_LEN);
-	}
-
-	// 解析起始时间戳（小端序）
-	uint32_t timestamp = sys_get_le32(buf);
-	
-	// 保存起始时间戳
-	history_start_timestamp = timestamp;
-	
-	printk("[历史数据] 设置起始时间戳: %u\r\n", timestamp);
-	
-	// 如果时间戳为0，表示发送全部数据；清除二分查找标记，让下次传输从 oldest_sector 开始
-	if (timestamp == 0) {
-		history_binary_search_done = false;
-		printk("[历史数据] 将发送全部历史数据\r\n");
-	} else {
-		printk("[历史数据] 将只发送时间戳大于 %u 的数据\r\n", timestamp);
-	}
-	
-	return len;
+    ARG_UNUSED(conn); ARG_UNUSED(attr); ARG_UNUSED(flags);
+    if (offset != 0U) return BT_GATT_ERR(BT_ATT_ERR_INVALID_OFFSET);
+    if (len != 4U && len != 5U) return BT_GATT_ERR(BT_ATT_ERR_INVALID_ATTRIBUTE_LEN);
+    const uint8_t *bytes = buf;
+    if (len == 5U && bytes[4] == 4U) {
+        int ret = retention_request(sys_get_le32(bytes));
+        return ret ? BT_GATT_ERR(BT_ATT_ERR_WRITE_NOT_PERMITTED) : len;
+    }
+    if (len == 5U && bytes[4] != 3U) return BT_GATT_ERR(BT_ATT_ERR_VALUE_NOT_ALLOWED);
+    if (retention_busy || data_clear_in_progress || history_transfer_active)
+        return BT_GATT_ERR(BT_ATT_ERR_WRITE_NOT_PERMITTED);
+    history_wire_size = len == 5U ? 14U : 12U;
+    history_start_timestamp = sys_get_le32(bytes);
+    history_binary_search_done = false;
+    return len;
 }
 
 // 历史记录信息特性读取回调（返回总记录数、起始扇区、起始记录索引）
@@ -979,7 +1188,7 @@ static ssize_t history_info_char_read_cb(struct bt_conn *conn,
 	if (total_records > 0) {
 		// 有数据时，从最旧扇区的第0条开始线性读取
 		start_sector = oldest_sector;
-		start_record_idx = 0;
+		start_record_idx = storage_first_record();
 	}
 	
 	// 准备返回数据：总记录数(4字节) + 起始扇区(2字节) + 起始记录索引(2字节) = 8字节
@@ -1042,6 +1251,7 @@ static void history_char_ccc_cfg_changed(const struct bt_gatt_attr *attr, uint16
 	bool notify_enabled = (value == BT_GATT_CCC_NOTIFY);
 	printk("[历史] 数据通知: %s\r\n", notify_enabled ? "启用" : "禁用");
 	
+	if (notify_enabled && (retention_busy || data_clear_in_progress)) return;
 	if (notify_enabled) {
 		// 启用通知，开始发送历史数据
 		// 强制重置状态，确保每次启用通知都能从头开始传输
@@ -1063,7 +1273,7 @@ static void history_char_ccc_cfg_changed(const struct bt_gatt_attr *attr, uint16
 		
 		// 从最旧扇区开始发送（如果有时间戳过滤，二分查找会重新定位）
 		history_transfer_sector = oldest_sector;
-		history_transfer_record_idx = 0;
+		history_transfer_record_idx = storage_first_record();
 		if (history_start_timestamp == 0) {
 			printk("[历史] 开始传输（全部），共 %u 条记录，从扇区 %d 开始\r\n", 
 			       history_expected_records, history_transfer_sector);
@@ -1532,7 +1742,7 @@ static ssize_t clear_data_char_write_cb(struct bt_conn *conn,
 		return BT_GATT_ERR(BT_ATT_ERR_INVALID_ATTRIBUTE_LEN);
 	}
 	
-	if (data_clear_in_progress) {
+	if (data_clear_in_progress || retention_busy || retention.limit) {
 		printk("[清空数据] 警告: 清空操作正在进行中，忽略重复请求\r\n");
 		return BT_GATT_ERR(BT_ATT_ERR_WRITE_NOT_PERMITTED);
 	}
@@ -1860,6 +2070,7 @@ static void bt_disconnected_cb(struct bt_conn *conn, uint8_t reason)
 	
 	// 重置历史数据传输的时间戳过滤条件
 	// 避免下次连接时如果不设置时间戳，残留的旧值导致无法获取数据
+    history_wire_size = 12U;
 	if (history_start_timestamp != 0) {
 		history_start_timestamp = 0;
 		printk("[历史] 断开连接，重置起始时间戳为 0\r\n");
@@ -1958,9 +2169,9 @@ static uint32_t __maybe_unused get_current_timestamp(void)
 // ========== Flash 存储功能（使用W25Q64） ==========
 
 // W25Q64存储布局：
-// - 每个扇区(4KB)可以存储 512 条记录 (4096 / 8)
-// - 使用前1MB存储区域，共256个扇区
-// - 每条记录8字节：timestamp(4) + temperature(2) + humidity(2)
+// - 每条记录12字节：timestamp(4) + temperature(2) + humidity(2) + pressure/voltage编码字(4)
+// - 每页21条、每扇区336条；history物理区1MiB，共256扇区，环形逻辑容量按65000条限制为194扇区
+// - 启用retention.limit后按持续逻辑窗口保留（当前命令支持3000条），不改变物理分区
 // - 使用环形缓冲区，按扇区擦除
 
 // 存储管理变量（改用扇区索引）- 已在前面声明
@@ -1970,58 +2181,17 @@ static uint32_t __maybe_unused get_current_timestamp(void)
 // 返回时更新 next_sector、next_record_in_sector（不修改 oldest_sector，由调用方设置）
 static void storage_scan_flash_for_write_head(uint16_t assumed_oldest_sector)
 {
-	uint8_t b;
-	int ret;
-	uint16_t n_sec = (next_sector >= assumed_oldest_sector)
-		? (next_sector - assumed_oldest_sector)
-		: (W25Q64_MAX_SECTORS_LIMIT - assumed_oldest_sector + next_sector);
-	if (n_sec == 0) {
-		n_sec = W25Q64_MAX_SECTORS_LIMIT;
-	}
-	uint16_t low = 0;
-	uint16_t high = n_sec;
-	while (low < high) {
-		uint16_t mid = low + (high - low) / 2;
-		uint16_t s = (assumed_oldest_sector + mid) % W25Q64_MAX_SECTORS_LIMIT;
-		uint32_t addr = W25Q64_STORAGE_BASE + s * W25Q64_SECTOR_SIZE;
-		ret = w25q64_read(addr, &b, 1);
-		if (ret != 0) {
-			break;
-		}
-		if (b != 0xFF) {
-			low = mid + 1;
-		} else {
-			high = mid;
-		}
-	}
-	uint16_t last_sec = (assumed_oldest_sector + (low > 0 ? low - 1 : 0)) % W25Q64_MAX_SECTORS_LIMIT;
-	uint16_t last_rec = 0;
-	uint32_t sec_base = W25Q64_STORAGE_BASE + last_sec * W25Q64_SECTOR_SIZE;
-	for (uint16_t i = 0; i < W25Q64_RECORDS_PER_SECTOR; i++) {
-		uint16_t pi = i / W25Q64_RECORDS_PER_PAGE;
-		uint16_t ip = i % W25Q64_RECORDS_PER_PAGE;
-		uint32_t addr = sec_base
-			+ (uint32_t)pi * W25Q64_PAGE_SIZE
-			+ (uint32_t)ip * W25Q64_RECORD_SIZE;
-		ret = w25q64_read(addr, &b, 1);
-		if (ret != 0) {
-			break;
-		}
-		if (b == 0xFF) {
-			last_rec = i;
-			break;
-		}
-		last_rec = i + 1;
-	}
-	if (last_rec >= W25Q64_RECORDS_PER_SECTOR) {
-		next_sector = (last_sec + 1) % W25Q64_MAX_SECTORS_LIMIT;
-		next_record_in_sector = 0;
-	} else {
-		next_sector = last_sec;
-		next_record_in_sector = last_rec;
-	}
-	printk("[存储] Flash 扫描定位写头完成 next=%d rec=%d (假定 oldest=%d)\r\n",
-	       next_sector, next_record_in_sector, assumed_oldest_sector);
+    ARG_UNUSED(assumed_oldest_sector);
+    struct data_record record;
+    for (uint32_t n = 0; n < HISTORY_SLOT_COUNT; ++n) {
+        uint32_t slot = storage_head_slot();
+        int ret = w25q64_read(storage_record_address(slot), (uint8_t *)&record, sizeof(record));
+        if (ret || history_bytes_erased(&record, sizeof(record))) break;
+        /* All occupied slots, including torn and zeroed records, consume their address. */
+        slot = (slot + 1U) % HISTORY_SLOT_COUNT;
+        next_sector = slot / W25Q64_RECORDS_PER_SECTOR;
+        next_record_in_sector = slot % W25Q64_RECORDS_PER_SECTOR;
+    }
 }
 
 // 初始化 Flash 存储
@@ -2081,44 +2251,15 @@ static int storage_init(void)
 	return 0;  // 清空后直接返回，跳过后续的写头定位逻辑
 #endif
 
-	// 启动时自动找回写头：先校验 NVS 位置，若不一致则二分法 + 线性扫精确定位
-	// 重要：使用与写入时相同的地址计算方式（页索引+页内索引），确保地址一致
-	uint16_t page_index = next_record_in_sector / W25Q64_RECORDS_PER_PAGE;
-	uint16_t index_in_page = next_record_in_sector % W25Q64_RECORDS_PER_PAGE;
-	uint32_t base = W25Q64_STORAGE_BASE + next_sector * W25Q64_SECTOR_SIZE
-		+ (uint32_t)page_index * W25Q64_PAGE_SIZE
-		+ (uint32_t)index_in_page * W25Q64_RECORD_SIZE;
-	uint8_t b;
-	ret = w25q64_read(base, &b, 1);
-
-	bool check_passed = (ret == 0 && b == 0xFF);
-
-	// 增强校验：如果写头不是扇区首条，检查前一条记录是否有效
-	// 防止 Flash 被擦除但 NVS 未更新导致的位置错误
-	if (check_passed && next_record_in_sector > 0) {
-		uint16_t prev_idx = next_record_in_sector - 1;
-		uint16_t prev_page = prev_idx / W25Q64_RECORDS_PER_PAGE;
-		uint16_t prev_in_page = prev_idx % W25Q64_RECORDS_PER_PAGE;
-		uint32_t prev_addr = W25Q64_STORAGE_BASE + next_sector * W25Q64_SECTOR_SIZE
-			+ (uint32_t)prev_page * W25Q64_PAGE_SIZE
-			+ (uint32_t)prev_in_page * W25Q64_RECORD_SIZE;
-		
-		uint8_t prev_b;
-		int prev_ret = w25q64_read(prev_addr, &prev_b, 1);
-		
-		// 如果前一条记录也是 0xFF，说明数据可能已丢失，校验失败
-		if (prev_ret != 0 || prev_b == 0xFF) {
-			printk("[存储] NVS 校验失败: 前一条记录无效 (0xFF)，可能数据已丢失\r\n");
-			check_passed = false;
-		}
-	}
-
-	if (check_passed) {
-		printk("[存储] NVS 位置校验通过 (写头 0xFF，前序有效)\r\n");
-	} else {
-		// NVS 落后或与 Flash 不一致：扫描 Flash 重新定位写头
-		storage_scan_flash_for_write_head(oldest_sector);
-	}
+    if (next_sector >= W25Q64_MAX_SECTORS_LIMIT ||
+            oldest_sector >= W25Q64_MAX_SECTORS_LIMIT ||
+            next_record_in_sector > W25Q64_RECORDS_PER_SECTOR) {
+        return -EINVAL; /* never erase data after an invalid persisted pointer */
+    }
+    uint32_t normalized_head = storage_head_slot();
+    next_sector = normalized_head / W25Q64_RECORDS_PER_SECTOR;
+    next_record_in_sector = normalized_head % W25Q64_RECORDS_PER_SECTOR;
+    storage_scan_flash_for_write_head(oldest_sector);
 
 	// 检查并调整：如果超过最大记录数限制，调整到限制范围内
 	if (next_sector >= W25Q64_MAX_SECTORS_LIMIT) {
@@ -2134,6 +2275,17 @@ static int storage_init(void)
 		oldest_sector = 0;
 	}
 
+    if (retention.limit) {
+        uint16_t previous_first = oldest_sector;
+        retention_scan_begin();
+        int scan_ret;
+        do { scan_ret = retention_scan_step(); } while (scan_ret == 1);
+        if (scan_ret) return scan_ret;
+        if (retention.gc_sector == HISTORY_GC_DONE) retention.gc_sector = previous_first;
+        retention_busy = true;
+        retention_phase = 2U;
+        k_work_schedule(&retention_work, K_NO_WAIT);
+    }
 	uint32_t total_records = storage_get_total_records();
 
 	// 一次性修复：若推算总记录数为 0 但 Flash 扇区 0 首字节非 0xFF，说明 NVS/位置与 Flash 不一致，强制清 NVS 并重新从 Flash 扫描定位写头
@@ -2146,7 +2298,7 @@ static int storage_init(void)
 			oldest_sector = 0;
 			next_sector = 0;
 			next_record_in_sector = 0;
-			storage_scan_flash_for_write_head(0);
+            storage_scan_flash_for_write_head(0);
 			position_dirty = true;
 			total_records = storage_get_total_records();
 			// 立即写回 NVS，使修复后的位置持久化
@@ -2196,6 +2348,7 @@ static void storage_write_batch(void)
 		return;
 	}
 
+    if (retention_busy) return;
 	if (ram_buffer_count == 0) {
 		printk("[存储] 警告: 缓冲区为空，无需写入\r\n");
 		return;
@@ -2237,7 +2390,9 @@ static void storage_write_batch(void)
 		}
 		
 		// 4. 检查气压 (10000 ~ 200000)
-		if (ram_buffer[i].pressure_pa < 10000 || ram_buffer[i].pressure_pa > 200000) {
+        uint32_t decoded_pressure;
+        uint16_t decoded_voltage;
+        if (!history_decode_pressure(ram_buffer[i].pressure_pa, &decoded_pressure, &decoded_voltage)) {
 			printk("[存储] 警告: 发现无效气压记录 (%u, 索引 %d)，已过滤\r\n", 
 			       ram_buffer[i].pressure_pa, i);
 			is_valid = false;
@@ -2314,36 +2469,55 @@ static void storage_write_batch(void)
 			+ (uint32_t)page_index * W25Q64_PAGE_SIZE
 			+ (uint32_t)index_in_page * W25Q64_RECORD_SIZE;
 
-		/* 当前页剩余可写记录数（至少 1），与剩余待写记录数取较小值 */
-		uint16_t records_in_page = W25Q64_RECORDS_PER_PAGE - index_in_page;
-		uint16_t chunk = (nr - written) < records_in_page ? (nr - written) : records_in_page;
-		size_t   chunk_len = (size_t)chunk * W25Q64_RECORD_SIZE;
-
-		// printk("[存储] 按页写入: page=%u, index_in_page=%u, addr=0x%06X, chunk=%u 条, len=%u 字节\r\n",
-		//        (unsigned)page_index, (unsigned)index_in_page,
-		//        (unsigned)write_addr, (unsigned)chunk, (unsigned)chunk_len);
-
-		ret = w25q64_page_program(write_addr, (const uint8_t *)&ram_buffer[written], chunk_len);
-		if (ret != 0) {
-			printk("[存储] 页编程失败: %d，保留 %d 条待重试\r\n", ret, nr - written);
-			storage_keep_unwritten(written, nr);
-			w25q64_sleep();
-			goto out_unlock;
-		}
-		ret = w25q64_wait_ready();
-		if (ret != 0) {
-			printk("[存储] 等待就绪失败: %d，保留 %d 条待重试\r\n", ret, nr - written);
-			storage_keep_unwritten(written, nr);
-			w25q64_sleep();
-			goto out_unlock;
-		}
-
-		// printk("[存储] 本页写入完成: page=%u, index_in_page=%u, addr=0x%06X, chunk=%u 条\r\n",
-		//        (unsigned)page_index, (unsigned)index_in_page,
-		//        (unsigned)write_addr, (unsigned)chunk);
-
-		written += chunk;
-		next_record_in_sector += chunk;
+        struct data_record staged = ram_buffer[written];
+        struct data_record check;
+        staged.pressure_pa |= 0x40000000U;
+        ret = w25q64_read(write_addr, (uint8_t *)&check, sizeof(check));
+        if (ret) goto write_error;
+        if (!history_bytes_erased(&check, sizeof(check))) {
+            if (memcmp(&check, &ram_buffer[written], sizeof(check)) == 0) {
+                /* A previous commit succeeded but its completion/error was lost. */
+                written++;
+                next_record_in_sector++;
+                retention_after_write();
+                if (retention_busy && written < nr) {
+                    storage_keep_unwritten(written, nr);
+                    goto out_unlock;
+                }
+            } else {
+                /* Torn/occupied slots are consumed, never programmed over. */
+                next_record_in_sector++;
+            }
+            continue;
+        }
+        ret = w25q64_page_program(write_addr, (const uint8_t *)&staged, sizeof(staged));
+        if (ret) goto write_error;
+        ret = w25q64_read(write_addr, (uint8_t *)&check, sizeof(check));
+        if (ret || memcmp(&check, &staged, sizeof(check))) {
+            ret = ret ? ret : -EIO;
+            goto write_error;
+        }
+        /* Marker-last: only clear bit 6 of the pressure high byte after payload verification. */
+        uint8_t commit_byte = ((const uint8_t *)&ram_buffer[written])[11];
+        ret = w25q64_page_program(write_addr + 11U, &commit_byte, 1U);
+        if (ret) goto write_error;
+        uint8_t committed_byte;
+        ret = w25q64_read(write_addr + 11U, &committed_byte, 1U);
+        if (ret || committed_byte != commit_byte) {
+            ret = ret ? ret : -EIO;
+            goto write_error;
+        }
+        written++;
+        next_record_in_sector++;
+        retention_after_write();
+        if (retention_busy && written < nr) {
+            storage_keep_unwritten(written, nr);
+            goto out_unlock;
+        }
+        continue;
+write_error:
+        storage_keep_unwritten(written, nr);
+        goto out_unlock;
 	}
 
 	// printk("[存储] 批量写入成功 扇区=%d 记录=%d-%d 共 %d 条\r\n",
@@ -2390,12 +2564,12 @@ static bool linear_find_first_after_timestamp(uint32_t target_timestamp,
 	}
 	if (target_timestamp == 0) {
 		*out_sector = oldest_sector;
-		*out_record_idx = 0;
+		*out_record_idx = storage_first_record();
 		return true;   /* 要全部，从 oldest 开始 */
 	}
 
 	uint16_t cur_sector = oldest_sector;
-	uint16_t cur_idx = 0;
+	uint16_t cur_idx = storage_first_record();
 	struct data_record rec;
 	int ret;
 
@@ -2417,12 +2591,12 @@ static bool linear_find_first_after_timestamp(uint32_t target_timestamp,
 				cur_idx++;
 				continue;
 			}
-			if (rec.timestamp == 0xFFFFFFFF) {
+			if (history_bytes_erased(&rec, sizeof(rec))) {
 				/* 无效/空，本扇区后续不再有效，跳到下一扇区 */
 				cur_idx = max_in_sector;
 				break;
 			}
-			if (rec.timestamp > target_timestamp) {
+			if (storage_valid_record(&rec) && rec.timestamp > target_timestamp) {
 				*out_sector = cur_sector;
 				*out_record_idx = cur_idx;
 				return true;
@@ -2668,7 +2842,7 @@ static void history_send_work_handler(struct k_work *work)
 	} else if (!history_binary_search_done) {
 		// 要全部（timestamp==0）：强制从最旧扇区开始，避免残留上次“按时间戳”的传输位置导致只传几十条
 		history_transfer_sector = oldest_sector;
-		history_transfer_record_idx = 0;
+		history_transfer_record_idx = storage_first_record();
 		history_binary_search_done = true;
 	}
 
@@ -2762,7 +2936,7 @@ static void history_send_work_handler(struct k_work *work)
 		max_records_in_sector = next_record_in_sector;
 	}
 	
-	while (records_collected < STREAM_RECORDS_PER_PACKET && 
+	while (records_collected < STREAM_PACKET_SIZE / history_wire_size &&
 	       history_transfer_record_idx + records_scanned < max_records_in_sector) {
 		
 		// 重要：使用与写入时相同的地址计算方式（页索引+页内索引），确保地址一致
@@ -2782,7 +2956,7 @@ static void history_send_work_handler(struct k_work *work)
 		}
 		
 		// 检查记录是否有效
-		if (rec.timestamp == 0xFFFFFFFF) {
+		if (history_bytes_erased(&rec, sizeof(rec))) {
 			// 遇到无效记录，当前扇区读取完毕
 			// 如果我们还没读到预期的 next_record_in_sector，说明Flash数据可能不一致
 			if (history_transfer_sector == next_sector && 
@@ -2838,9 +3012,11 @@ static void history_send_work_handler(struct k_work *work)
 		}
 		
 		// 检查气压范围 (100hPa ~ 2000hPa -> 10000Pa ~ 200000Pa)
-		if (rec.pressure_pa < 10000 || rec.pressure_pa > 200000) {
-			data_valid = false;
-		}
+        uint32_t decoded_pressure;
+        uint16_t decoded_voltage;
+        if (!history_decode_pressure(rec.pressure_pa, &decoded_pressure, &decoded_voltage)) {
+            data_valid = false;
+        }
 		
 		if (!data_valid) {
 			// 数据异常，跳过此记录
@@ -2849,8 +3025,10 @@ static void history_send_work_handler(struct k_work *work)
 		}
 		
 		// 将记录添加到发送缓冲区
-		memcpy(&tx_buf[tx_len], &rec, sizeof(struct data_record));
-		tx_len += sizeof(struct data_record);
+        rec.pressure_pa = decoded_pressure;
+        memcpy(&tx_buf[tx_len], &rec, sizeof(rec));
+        if (history_wire_size == 14U) sys_put_le16(decoded_voltage, &tx_buf[tx_len + 12U]);
+        tx_len += history_wire_size;
 		records_collected++;
 	}
 	
@@ -2925,7 +3103,7 @@ static void history_send_work_handler(struct k_work *work)
 	
 	// 发送数据包（使用 bt_gatt_notify_cb，实现“发完再发”流控）
 	if (tx_len > 0 && history_char_attr) {
-		struct data_record *last_rec = (struct data_record *)(tx_buf + tx_len - sizeof(struct data_record));
+		uint32_t last_timestamp = sys_get_le32(tx_buf + tx_len - history_wire_size);
 		
 		// 显示发送进度（每100包打印一次，避免刷屏）
 		uint32_t current_count = history_total_sent_records + records_collected;
@@ -2935,7 +3113,7 @@ static void history_send_work_handler(struct k_work *work)
 		}
 		
 		// 更新最后发送的时间戳
-		history_last_sent_timestamp = last_rec->timestamp;
+		history_last_sent_timestamp = last_timestamp;
 		
 		// 将要发送的数据拷贝到全局缓冲区，确保在回调前一直有效
 		memcpy(history_tx_buf, tx_buf, tx_len);
@@ -3026,6 +3204,7 @@ int main(void)
 		printk("[配置] 最低温度未初始化，等待首次采集更新\r\n");
 	}
 	
+    k_work_init_delayable(&retention_work, retention_work_handler);
 	// 从 NVS 读取 W25Q64 位置，再 storage_init 里进行强制擦除/写头定位
 	{
 		storage_position_t pos = {0, 0, 0};
@@ -3033,6 +3212,19 @@ int main(void)
 		next_sector = pos.next_sector;
 		oldest_sector = pos.oldest_sector;
 		next_record_in_sector = pos.next_record_in_sector;
+        if (nvs_load_history_retention(&retention) == 0 && retention.limit == 3000U &&
+                retention.head_sector < W25Q64_MAX_SECTORS_LIMIT &&
+                retention.head_record <= W25Q64_RECORDS_PER_SECTOR &&
+                retention.first_sector < W25Q64_MAX_SECTORS_LIMIT &&
+                retention.first_record < W25Q64_RECORDS_PER_SECTOR &&
+                retention.count <= retention.limit &&
+                (retention.gc_sector == HISTORY_GC_DONE || retention.gc_sector < W25Q64_MAX_SECTORS_LIMIT)) {
+            next_sector = retention.head_sector;
+            next_record_in_sector = retention.head_record;
+            oldest_sector = retention.first_sector;
+        } else {
+            memset(&retention, 0, sizeof(retention));
+        }
 	}
 	// 从 NVS 加载时间（如果之前已同步过）
 	{

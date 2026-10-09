@@ -24,6 +24,7 @@ extern "C" {
 #define NVS_ID_NEXT_RECORD    3
 #define NVS_ID_CONFIG         4
 #define NVS_ID_TIME_BASE      5
+#define NVS_ID_HISTORY_RETENTION 7
 #define NVS_ID_OTA            6   /* OTA 断点续传状态（offset / total / ih_ver / valid） */
 
 /* ================== 版本号：唯一来源是工程根的 VERSION 文件 ==================
@@ -90,6 +91,22 @@ typedef struct {
 	uint32_t min_temperature_timestamp;
 	uint16_t firmware_version;
 } __packed device_config_v2_t;
+
+/* Independent atomic checkpoint; legacy position keys 1..3 are unchanged. */
+#define HISTORY_RETENTION_MAGIC 0x48525431U
+#define HISTORY_GC_DONE 0xffffU
+typedef struct {
+    uint32_t magic;
+    uint16_t limit;
+    uint16_t head_sector;
+    uint16_t head_record;
+    uint16_t first_sector;
+    uint16_t first_record;
+    uint16_t count;
+    uint16_t gc_sector;
+} __packed history_retention_t;
+int nvs_load_history_retention(history_retention_t *retention);
+int nvs_save_history_retention(const history_retention_t *retention);
 
 /* 设备配置上下文 */
 typedef struct {

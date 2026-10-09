@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
-"""断电专项：在 MCUboot「次级槽 → 主槽」搬运途中强制复位，验证会不会变砖。
+"""复位专项：在 MCUboot「次级槽 → 主槽」搬运途中强制复位；不属于真实断电测试。
 
 为什么要这样打
 --------------
-真断电要人拔电池，无法自动化；用**复位**近似。MCUboot 搬运是纯软件状态机
-（擦主槽 → 逐块复制），复制途中复位等价于"断电后重新上电"，MCUboot 会重新判断并再搬一次。
-差别：真断电 RAM 全丢，复位后 RAM 可能保留 → 复位是**偏乐观**的近似，真断电仍需人工复核。
+本工具只做 SWD **复位**回归，不是真实断电矩阵。MCU 复位不会切断 W25Q64 电源，
+不能模拟 NOR Flash 擦写期间掉电；即使复位后恢复，也不能据此宣称 P3 真断电通过。
+真正断电必须使用人工电池断开或受控电源，并分别记录阶段命中证据和恢复证据。
 
 两个关键实现点（都踩过坑）
 --------------------------
@@ -46,9 +46,9 @@ IMAGE_MAGIC = 0x96F3B83D
 class Swd:
     """持有已初始化的 SWD 会话，避免擦写期间重新 open 超时。"""
 
-    def __init__(self):
+    def __init__(self, probe_id=None):
         self.s = ConnectHelper.session_with_chosen_probe(
-            unique_id="LU_2022_8888", target_override="nRF52810_xxAA",
+            unique_id=probe_id, target_override="nRF52810_xxAA",
             frequency=500000)
         self.s.open()
         self.t = self.s.target
@@ -117,18 +117,18 @@ async def advertise(timeout=12.0):
     return None
 
 
-async def arm_and_interrupt(swd, image_path, delay_ms):
+async def arm_and_interrupt(swd, image_path, delay_ms, key_text=None):
     """上传 → VERIFY → TRIGGER → 延迟 delay_ms → 复位 → 立刻快照 → 观察恢复。"""
     print("\n======== 打断延迟 %d ms ========" % delay_ms)
     rc = await C.run(argparse.Namespace(
-        file=image_path, bad_key=False, bad_sha=False, too_large=False,
+        file=image_path, key=key_text, bad_key=False, bad_sha=False, too_large=False,
         max_bytes=None, no_trigger=True, chunk=None, cancel=False,
         only_trigger=False, expect_err=None))
     if rc != 0:
         print("  上传失败，跳过该延迟")
         return None
 
-    c = C.OtaClient()
+    c = C.OtaClient(C.resolve_auth_key(key_text))
     await c.connect()
     try:
         await c.client.start_notify(C.STATUS_UUID, c.on_status)
@@ -150,9 +150,8 @@ async def arm_and_interrupt(swd, image_path, delay_ms):
 
     # 立刻快照：magic 无效 = 真的打在搬运窗口内
     hit = swd.snapshot("复位瞬间")
-    # hit 为 None = 当时 SWD 不可用（几乎总是因为 MCUboot 正在擦内部 Flash），
-    # 这本身就是"打在搬运窗口内"的强旁证；magic 无效则是直接证据。
-    caught = (hit is None) or (hit["magic"] != IMAGE_MAGIC)
+    # SWD failure alone cannot establish which boot phase was interrupted.
+    caught = hit is not None and hit["magic"] != IMAGE_MAGIC
 
     recovered = None
     for wait in (2, 3, 5, 10, 15):
@@ -177,16 +176,21 @@ async def main():
     ap.add_argument("--file", required=True, help="zephyr.signed.bin 路径")
     ap.add_argument("--delays", default="500,1500,2500",
                     help="逗号分隔的打断延迟（ms）")
+    ap.add_argument("--key", help="OTA authorization key; prefer OTA_AUTH_KEY environment variable")
+    ap.add_argument("--probe", help="Optional SWD probe unique ID; default selects available probe")
     args = ap.parse_args()
 
     delays = [int(x) for x in args.delays.split(",") if x.strip()]
+    if not delays or any(d < 0 for d in delays):
+        ap.error("At least one non-negative interruption delay is required")
+    C.resolve_auth_key(args.key)
     results = []
     for d in delays:
         # 每个延迟用**独立**的 SWD 会话：擦写期间的 FAULT ACK 会把会话搞脏，
         # 复用同一会话会让后续用例全部失败。
-        swd = Swd()
+        swd = Swd(args.probe)
         try:
-            r = await arm_and_interrupt(swd, args.file, d)
+            r = await arm_and_interrupt(swd, args.file, d, args.key)
             if r:
                 results.append(r)
         finally:
@@ -198,8 +202,8 @@ async def main():
               % (r["delay_ms"], "是" if r["caught"] else "否",
                  r["recovered_s"] or "未",
                  "是" if r["advertising"] else "否"))
-    all_ok = all(r["recovered_s"] and r["advertising"] for r in results)
-    print("结论: %s" % ("全部恢复，未变砖" if all_ok else "存在未恢复用例，需排查"))
+    all_ok = len(results) == len(delays) and all(r["caught"] and r["recovered_s"] and r["advertising"] for r in results)
+    print("结论: %s" % ("复位用例均命中并恢复（不证明真实断电）" if all_ok else "复位用例未命中、未恢复或证据不完整，需排查"))
     return 0 if all_ok else 1
 
 

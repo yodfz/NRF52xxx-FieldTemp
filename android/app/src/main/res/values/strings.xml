@@ -1,0 +1,11 @@
+<resources>
+    <string name="app_name">熊猫户外温度计</string>
+    <string name="weather_alert_channel_name">天气预警</string>
+    <string name="weather_alert_channel_description">暴风雨等气压骤降时的紧急提醒</string>
+    <!-- 蓝牙连接常驻通知 -->
+    <string name="ble_connection_channel_name">蓝牙连接</string>
+    <string name="ble_connection_channel_description">保持与设备的蓝牙连接，防止后台被系统结束</string>
+    <string name="ble_connection_notification_title">熊猫户外温度计</string>
+    <string name="ble_connection_notification_content">已连接至 %1$s，保持连接中</string>
+    <string name="ble_connection_notification_device_unknown">蓝牙设备</string>
+</resources>

@@ -1,0 +1,33 @@
+*.iml
+.gradle
+.kotlin
+/local.properties
+local.properties
+/.idea/caches
+/.idea/libraries
+/.idea/modules.xml
+/.idea/workspace.xml
+/.idea/navEditor.xml
+/.idea/assetWizardSettings.xml
+.DS_Store
+/captures
+.externalNativeBuild
+.cxx
+
+# 所有 Gradle 模块的构建产物（原规则只忽略根 /build，会漏掉 app/build）
+build/
+**/build/
+
+# 发布签名材料：绝不入库、绝不进源码压缩包
+keystore.properties
+*.jks
+*.keystore
+
+# 构建期注入的 OTA 授权密钥：绝不入库、绝不进源码压缩包
+ota.properties
+
+# 本地私有配置 / 凭据（当前工程未使用，留作防误提交）
+.env
+*.env
+secrets.properties
+google-services.json

@@ -451,3 +451,29 @@ void nvs_flush(device_config_ctx_t *config, const storage_position_t *pos)
 	}
 	nvs_unlock();
 }
+
+/* Commit and read-back one NVS item before any history reclamation. */
+int nvs_load_history_retention(history_retention_t *retention)
+{
+    if (!nvs_ready) return -ENODEV;
+    nvs_lock();
+    ssize_t len = nvs_read(&nvs_fs, NVS_ID_HISTORY_RETENTION,
+                           retention, sizeof(*retention));
+    nvs_unlock();
+    return len == sizeof(*retention) && retention->magic == HISTORY_RETENTION_MAGIC
+        ? 0 : (len < 0 ? (int)len : -EINVAL);
+}
+int nvs_save_history_retention(const history_retention_t *retention)
+{
+    if (!nvs_ready) return -ENODEV;
+    history_retention_t check;
+    nvs_lock();
+    int ret = nvs_write(&nvs_fs, NVS_ID_HISTORY_RETENTION, retention, sizeof(*retention));
+    if (ret >= 0) {
+        ssize_t len = nvs_read(&nvs_fs, NVS_ID_HISTORY_RETENTION, &check, sizeof(check));
+        ret = len == sizeof(check) && memcmp(&check, retention, sizeof(check)) == 0
+            ? 0 : -EIO;
+    }
+    nvs_unlock();
+    return ret;
+}

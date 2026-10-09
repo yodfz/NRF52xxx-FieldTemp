@@ -33,7 +33,7 @@
 | `sysbuild/mcuboot.conf` | MCUboot 自身的 Kconfig（SPI NOR、布局页 4096、RC 32k、关日志） |
 | `sysbuild/mcuboot.overlay` | MCUboot 的 devicetree（**与 App 独立，改引脚要同步改**） |
 | `pm_static.yml` | Partition Manager 静态布局（**唯一编辑入口**） |
-| `VERSION` | **镜像版本号唯一来源**（当前 `1.0.8` + tweak `0`） |
+| `VERSION` | **镜像版本号唯一来源**（当前 `1.0.9` + tweak `0`） |
 | `tools/build_sysbuild.py` | 构建包装（引号安全 + 签名私钥注入），见 §2 |
 
 ### 关键 Kconfig（摘自实际构建）
@@ -84,7 +84,7 @@
 ### 2.0 先把私钥路径设好（PowerShell）
 
 ```powershell
-$env:MCU_BOOT_SIGNING_KEY = "D:\keys\root-ec-p256.pem"
+$env:MCU_BOOT_SIGNING_KEY = "<仓库外的ECDSA-P256私钥路径>"
 ```
 
 > 私钥是**凭据**，**不要**复制进仓库，也不要把路径写死进脚本。
@@ -139,7 +139,7 @@ $env:PYTHONPATH = "C:/ncs/v3.2.1/bootloader/mcuboot/scripts"
 C:\ncs\toolchains\66cdf9b75e\opt\bin\python.exe -m imgtool.main verify `
   --key $env:MCU_BOOT_SIGNING_KEY `
   build-v9\NRF52xxx-FieldTemp\zephyr\zephyr.signed.bin
-# 期望输出：Image was correctly validated / Image version: 1.0.8+0
+# 当前源码构建期望：Image was correctly validated / Image version: 1.0.9+0
 ```
 
 ### 2.5 查看构建产物
@@ -288,7 +288,7 @@ $HEX = "C:\Users\linckr\NRF52xxx-FieldTemp\build-v9\merged.hex"
 | `size_diff.py` | 两个构建的 ROM/RAM 差异对比 |
 | `ota_host_client.py` | PC 侧 BLE OTA 客户端（需要装了 bleak 的解释器） |
 | `ota_mkbadsig.py` | 造"坏签名"镜像（只翻 ECDSA 签名 TLV 1 字节） |
-| `ota_powerloss_reset.py` | 断电专项 |
+| `ota_powerloss_reset.py` | SWD 复位回归，不等同于真实断电 |
 | `w25q64_host_dfu.py` | 主机侧外置 Flash 读写（**有运行扰动**，见 §4.5） |
 | `free_ble.py` | **PC 侧 BLE 测试前必用**：确保手机让出 BLE（`am force-stop` 不够） |
 | `verify_v6_timing.py` | 记录周期与事件限流验证 |
@@ -322,7 +322,7 @@ C:\Users\linckr\.workbuddy\binaries\python\envs\default\Scripts\python.exe tools
 | `targetSdk` | **36** | 同上 |
 | `minSdk` | **26** | 同上 |
 | `applicationId` / `namespace` | `com.example.pandatemperature` | 同上 |
-| `versionCode` / `versionName` | **1 / "1.0"** | 同上（**与固件版本无关**） |
+| `versionCode` / `versionName` | **4 / "1.1.2"** | 同上（**与固件版本无关**） |
 | Java / Kotlin target | 11 | 同上 |
 | 构建变体 | `debug` / `release` | 无 flavor |
 
@@ -356,7 +356,7 @@ sdk.dir=<你的 Android SDK 路径>
 
 ```powershell
 $env:JAVA_HOME   = "C:\Users\linckr\.workbuddy\binaries\jdk\jdk-17.0.20.1+1"
-$SRC = "C:\Users\linckr\Documents\Codex\2026-09-08\referenced-chatgpt-conversation-this-is-an\PandaThemperature-Android\source"
+$SRC = "C:\Users\linckr\NRF52xxx-FieldTemp\android"
 ```
 
 ### 8.1 Debug 构建
@@ -466,3 +466,51 @@ Windows 上跑 `tools/ota_host_client.py` / `free_ble.py` 之前：
    （常见"连上立刻掉"，表现为 `start_notify` 抛 Not connected）
    → 必须把 `connect + start_notify + START` 作为**整体**重试。
 5. 客户端脚本要加 `python -u`，否则重定向到文件时看不到进度。
+
+## 2026-10-09 P2构建与生产签名阶段
+
+开发签名 `build-p2-dev` 已完成sysbuild及门禁：Flash151540 B、signed152203 B、RAM23080 B；
+相对v8增加Flash2012 B、RAM128 B，RAM余1496 B；MCUboot仍31876 B，余892 B。
+签名镜像相对primary减6 KiB预留的157696 B红线余5493 B；ECDSA DER长度可能有逐次差异。
+分区与MCUboot配置没有修改，新历史存储码及协议见PROTOCOL §3。
+
+native C测试通过TinyCC编译真实生产函数及实际序列化片段，NOR/NVS替身故障注入为0 failures：
+33000→3000、元数据失败时不擦除、回收中断恢复、跨物理环形边界、撕裂槽、丢失提交应答、
+批量跨扇区和12/14 B传输。入口如下；编译器路径由本机提供，不下载/提交测试二进制：
+
+```powershell
+python tools/test_history_storage.py --cc "<本机native C编译器路径>" --work-dir "<本机临时目录>"
+```
+
+Android124项单测通过，生产签名APK已验签；当前源码versionCode4/versionName1.1.2。
+生产密钥及签名配置全部在仓库外；Android使用PANDA_RELEASE_KEYSTORE_PROPERTIES注入外置配置，
+固件使用MCU_BOOT_SIGNING_KEY或--signing-key。不要把真实文件、路径细节或内容写入Git。
+生产ECDSA公钥必须先通过SWD配置到MCUboot，现有设备只信任原公钥，不能直接OTA换成新签名。
+生产APK验签与设备固件生产信任部署是不同验收项。
+
+已完成开发信任链 1.0.9 升级与主槽逐字节回读、V3 历史回读和硬件精确保留3000条；P3已取得擦除流程、部分写入、END后和暂停搬运流程的真实电池断电恢复证据，但不证明 NOR/NVMC 忙脉冲中断电。保留策略冷启动持久性已验证；realme到小米数据库迁移已完成；持续App3000策略retain验收通过，最新Live回归已通过；生产信任链部署待完成。 具体证据与耗时见HANDOFF最新阶段记录。
+原始数据已本机留档并确认SWD识别；私人数据库、完整备份及凭据不随提交上传。
+
+### 2026-10-10 当前验收状态：App 1.1.2 / 持续3000条
+
+当前App为versionCode4 / versionName1.1.2、Room11，手机安装Debug APK；Firmware为开发信任链1.0.9。124项JVM单元测试、10项isolated Room测试通过；生产1.1.2 APK v2/RSA3072验签通过、证书未变，尚未安装生产APK。最新Live连续全量/立即重试/中途断连/重连回归171.105 s通过；最终归档结果见本节末。
+
+手机已完成realme完整数据库到小米迁移（主库SHA匹配源归档），原小米1,042条GPS已备份、未并入。随后按完整归档及硬件raw集合应用精简；早先一次精简后App增至3004而硬件仍3000，确认一次性精简不足，现已实现持续策略。最新明确retain真机36.388 s通过：硬件3000、App模块3000、手机来源样本208；启用标记已持久化。手机样本包含有/无GPS，模块3000不等于整个数据库总行数；隔离记录及私人完整档案仍保留本机，不上传。
+
+持续策略按device显式启用：仅在retain3000命令得到count=3000且idle确认后保存本地prefs。对已启用且支持0x80的设备，每次历史同步发timestamp=0全量请求；只有本会话真实END、received=3000、唯一wire timestamps=3000、前后原始8 B HISTORY_INFO完全一致、所有upsert成功及连接/会话仍属于捕获目标时，才事务删除不在该实际wire集合的模块行。删除ID每批最多500，失败/取消/切换设备全部回滚、不删除；窗口不稳定最多自动重试一次。不能按时间排序取3000，缓存行可能比设备窗口更新。启用标记仅代表策略启用，不能代替每次精简成功证据。
+
+Room11的isPhoneSample采用INTEGER NOT NULL DEFAULT0；新手机实时行始终true，即使没有GPS。10→11无损迁移把已有GPS行标为phone，旧无GPS来源未知保守默认false；在完整归档后按真实wire集合核对，不能靠年份猜测删除。历史DAO/count/增量仅处理false且geoNull；所有phone/GPS、隔离表和其他设备受保护。严格核心数值断言曾阻止单行旧手机实时/硬件差异的错误精简，没有通过放宽断言绕过。测试覆盖来源保护、精确164缓存差集、1201条跨删除批次、SQL中段abort和session失效原子回滚。
+
+硬件3000策略已在隔离整根SWD后的实际电池断电冷启动验证：archive_sync23.296 s、完整3000及核心/GPS/无重复/未来检查通过；再次raw19.434 s通过（3000 V3、42000 B、END、8 B INFO稳定）。此前小米1.1.0 archive_sync79.289 s通过是历史证据；当前1.1.2也已独立完成Live回归，见本节末。VDD2.765 V为10/9约18:45观测、2.875 V为10/10约00:17 VM观测，均非当前实时读数，ADC仍未校准/无万用表对照。
+
+P3四阶段已取得擦除流程、部分写入、END后及暂停MCUboot搬运的真实电池断电恢复证据；不证明NOR WIP/NVMC写脉冲被切断。SWD仍连接时曾出现W25Q64 init_res=22，根因未定，隔离SWD重试通过不等于已定位。旧v8硬件尾部14条曾被覆盖，timestamp/传感器数值14/14均在本机完整App档案保全；新恢复函数已有真实C回归与冷启动证据。
+
+固件资源保持App Flash151540 B、RAM23080 B（余1496 B），MCUboot31876 B（余892 B），分区不变。DEV signed候选152203 B已真机回读；生产asset152202 B未部署，DER长度可变。两镜像App payload151540 B逐字节一致，SHA256 `236323e4319f7228ce6b4856bb1736a4bede1cf58e3dfc85239678bdc943494c`；完整signed文件不能混同。生产imgtool验证通过，但生产MCUboot公钥信任尚未部署、候选产物入口为 [v1.0.9-rc.1](https://github.com/linckr/NRF52xxx-FieldTemp/releases/tag/v1.0.9-rc.1)，发布状态以页面为准；两个upstream PR #2在最近记录时OPEN，后续实时核对。
+
+持续策略与Live验收已完成，最终归档模块3000；生产信任部署与ADC校准仍是独立待办。
+
+### 最终Live与一致归档验收
+
+最终真机Live回归171.105 s通过：两次连续全量各3000、立即重试、收到部分记录后断连且全部既有模块ID未删除、重连及再次同步完成3000；仍保留窗口内记录ID/核心字段和所有既有手机样本，无重复/未来时间。重连首轮观察到0条历史、随后一次自动全量重试成功；本轮已由有界重试覆盖，但首次重连延迟为Medium性能边界，根因未定位。
+
+最终只读一致归档（2026-10-10约01:12）SQLite integrity ok：模块3000、GPS187、无GPS手机样本31（受保护手机样本共218）、active3218、quarantine22484，未来时间0、模块重复0。Live期间VM电压开始2.886 V、结束2.868 V（本轮观测，不是ADC校准证明）。App已恢复运行；手机临时USB亮屏设置已恢复原值。私人数据库、档案路径、标识与归档内容不进Git。
